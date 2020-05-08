@@ -1,0 +1,122 @@
+---
+kind: pipeline
+type: docker
+name: vmpower-agent
+
+steps:
+  - name: restore-cache
+    image: drillster/drone-volume-cache
+    restore: true
+    volumes:
+      - name: cache
+        path: /tmp/cache
+    settings:
+      restore: true
+      mount:
+        - ./node_modules
+  - name: run_tests
+    commands:
+      - npm install
+      - npm run ci_validate
+    image: node:10.16.0
+  - name: build
+    commands:
+      - cp -R ./packages/ ./dist
+      - npm install
+      - npm i nexe -g
+      - nexe build/index.js --target linux-amd64 --name vmpower --output dist/debian/vmpower-agent/usr/bin/vmpower
+      - nexe build/index.js --target windows-amd64 --name vmpower --output dist/win32/vmpower-agent/tools/vmpower-agent.amd64.exe
+      - chmod 755 dist/debian/vmpower-agent/usr/bin/vmpower
+      - chmod 755 dist/debian/vmpower-agent/DEBIAN/postinst
+      - cd ./dist/debian
+      - dpkg-deb --build vmpower-agent
+      - mv vmpower-agent.deb vmpower-agent.amd64.deb
+      - cd ../../
+      - mkdir ./dist/linux
+      - tar -czvf ./dist/linux/vmpower-agent.amd64.tar.gz dist/debian/vmpower-agent/usr/bin/vmpower
+      - md5sum ./dist/linux/vmpower-agent.amd64.tar.gz > ./dist/linux/vmpower-agent.amd64.txt
+      - md5sum ./dist/debian/vmpower-agent.amd64.deb > ./dist/debian/vmpower-agent.amd64.deb.txt
+    image: node:10.16.0
+  - name: debian_deploy
+    environment:
+      PLUGIN_CONTAINER: repo
+      PLUGIN_SOURCE: ./dist/debian/vmpower-agent.amd64.deb
+      PLUGIN_ACCOUNT:
+        from_secret: storage_account
+      PLUGIN_ACCOUNT_KEY:
+        from_secret: storage_key
+    image: plugins/azure-storage
+  - name: debian_checksum_deploy
+    environment:
+      PLUGIN_CONTAINER: repo
+      PLUGIN_SOURCE: ./dist/debian/vmpower-agent.amd64.deb.txt
+      PLUGIN_ACCOUNT:
+        from_secret: storage_account
+      PLUGIN_ACCOUNT_KEY:
+        from_secret: storage_key
+    image: plugins/azure-storage
+  - name: linux_deploy
+    environment:
+      PLUGIN_CONTAINER: repo
+      PLUGIN_SOURCE: ./dist/linux/vmpower-agent.amd64.tar.gz
+      PLUGIN_ACCOUNT:
+        from_secret: storage_account
+      PLUGIN_ACCOUNT_KEY:
+        from_secret: storage_key
+    image: plugins/azure-storage
+  - name: linux_checksum_deploy
+    environment:
+      PLUGIN_CONTAINER: repo
+      PLUGIN_SOURCE: ./dist/linux/vmpower-agent.amd64.txt
+      PLUGIN_ACCOUNT:
+        from_secret: storage_account
+      PLUGIN_ACCOUNT_KEY:
+        from_secret: storage_key
+    image: plugins/azure-storage
+  - name: build_windows
+    commands:
+      - apt-get update
+      - apt-get install zip -y
+      - cd ./dist/win32/vmpower-agent
+      - sed -i 's@{{WIN32_AMD64_CHECKSUM}}@'"$WIN32_AMD64_CHECKSUM"'@' ./tools/chocolateyInstall.ps1
+      - choco pack --allow-unofficial
+      - mv vmpower-agent.0.0.1.nupkg vmpower-agent.nupkg
+      - zip -9 -y -r -q vmpower-agent.amd64.zip ./tools/vmpower-agent.amd64.exe
+      - md5sum ./vmpower-agent.amd64.zip > ./vmpower-agent.amd64.txt
+    image: linuturk/mono-choco
+  - name: win32_bin_deploy
+    environment:
+      PLUGIN_CONTAINER: repo
+      PLUGIN_SOURCE: ./dist/win32/vmpower-agent/vmpower-agent.amd64.zip
+      PLUGIN_ACCOUNT:
+        from_secret: storage_account
+      PLUGIN_ACCOUNT_KEY:
+        from_secret: storage_key
+    image: plugins/azure-storage
+  - name: win32_checksum_deploy
+    environment:
+      PLUGIN_CONTAINER: repo
+      PLUGIN_SOURCE: ./dist/win32/vmpower-agent/vmpower-agent.amd64.txt
+      PLUGIN_ACCOUNT:
+        from_secret: storage_account
+      PLUGIN_ACCOUNT_KEY:
+        from_secret: storage_key
+    image: plugins/azure-storage
+  - name: win32_choco_deploy
+    environment:
+      PLUGIN_CONTAINER: repo
+      PLUGIN_SOURCE: ./dist/win32/vmpower-agent/vmpower-agent.nupkg
+      PLUGIN_ACCOUNT:
+        from_secret: storage_account
+      PLUGIN_ACCOUNT_KEY:
+        from_secret: storage_key
+    image: plugins/azure-storage
+  - name: rebuild-cache
+    image: drillster/drone-volume-cache
+    volumes:
+      - name: cache
+        path: /tmp/cache
+    settings:
+      rebuild: true
+      mount:
+        - ./node_modules

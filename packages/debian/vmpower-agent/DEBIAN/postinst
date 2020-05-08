@@ -1,0 +1,17 @@
+#!/bin/bash
+
+CONFIG_FILE=/etc/vmpower.conf
+if test -f "$CONFIG_FILE"; then
+  echo
+else
+  cp /etc/vmpower-template.conf /etc/vmpower.conf
+  if [[ "${API_KEY}" ]]; then
+    sed -i 's@<API_KEY>@'"$API_KEY"'@' $CONFIG_FILE
+  fi
+  if [[ "${API_SECRET}" ]]; then
+    sed -i 's@<API_SECRET>@'"$API_SECRET"'@' $CONFIG_FILE 
+  fi
+  if [[ "${VM_ID}" ]]; then
+    sed -i 's@<VM_ID>@'"$VM_ID"'@' $CONFIG_FILE
+  fi
+fi

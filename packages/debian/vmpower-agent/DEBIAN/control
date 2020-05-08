@@ -1,0 +1,7 @@
+Package: vmpower-agent
+Architecture: all
+Maintainer: @vmpower
+Priority: optional
+Version: 0.1
+Description: VMPower agent to collect login data
+Depends: util-linux, sed

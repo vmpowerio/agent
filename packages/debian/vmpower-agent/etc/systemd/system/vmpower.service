@@ -1,0 +1,11 @@
+[Unit]
+Description=VMPower agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vmpower 
+User=vmpower
+
+[Install]
+WantedBy=multi-user.target

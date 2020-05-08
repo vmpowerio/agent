@@ -1,0 +1,34 @@
+{
+  "name": "vmpower-agent",
+  "version": "1.0.0",
+  "description": "VMPower CLI",
+  "main": "index.js",
+  "scripts": {
+    "test": "babel src/ -d build/ && jest build/test",
+    "build": "babel src/ -d build/",
+    "flow": "flow",
+    "lint": "./node_modules/.bin/eslint src",
+    "ci_validate": "npm run lint && npm run flow && npm run test"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "commander": "^5.1.0",
+    "moment": "^2.25.1",
+    "nconf": "^0.10.0",
+    "needle": "^2.4.1"
+  },
+  "devDependencies": {
+    "@babel/cli": "^7.8.4",
+    "@babel/core": "^7.9.6",
+    "@babel/preset-env": "^7.9.6",
+    "@babel/preset-flow": "^7.9.0",
+    "babel-eslint": "^10.1.0",
+    "babel-jest": "^26.0.1",
+    "eslint": "^7.0.0",
+    "eslint-plugin-flowtype": "^4.7.0",
+    "eslint-plugin-jest": "^23.11.0",
+    "flow-bin": "^0.124.0",
+    "jest": "^26.0.1"
+  }
+}
