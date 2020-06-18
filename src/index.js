@@ -7,7 +7,7 @@ import sendLoginInfo from "./lib/send-login-info";
 import setupArgs from "./lib/setup-args";
 
 let program = new Command();
-program.version("0.0.1");
+program.version("0.0.2");
 
 program = setupArgs(program, nconf);
 program.parse(process.argv);

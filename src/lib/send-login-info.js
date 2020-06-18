@@ -39,7 +39,7 @@ const sendLoginInfo = async (program: Command, runResult: RunLastResult) => {
     } else {
       console.error(
         `failed to send login data for vm_id=${vm} message=${
-          response.body ? response.body.message : ""
+          response.body ? response.body.toString() : ""
         }`
       );
     }
