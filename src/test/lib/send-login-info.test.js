@@ -78,7 +78,7 @@ describe("setupArgs", () => {
       }
     );
     expect(console.error).toBeCalledWith(
-      "failed to send login data for vm_id=resource-group/unit-test-machine message=test failure"
+      "failed to send login data for vm_id=resource-group/unit-test-machine message={\"message\":\"test failure\"}"
     );
   });
 });
