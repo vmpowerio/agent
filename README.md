@@ -1,6 +1,6 @@
 # VMPower agent
 
-Collects login data for your virtual machines and reports them to your VMPower account. Read the documentation [here](https://docs.vmpower.com/VMPower%20agent%20%5Bbeta%5D/Getting-Started/).
+Collects login data for your virtual machines and reports them to your VMPower account. Read the documentation [here](https://help.vmpower.com/VMPower%20agent%20%5Bbeta%5D/Getting-Started/).
 
 # Developing
 
