@@ -6,7 +6,7 @@
   "scripts": {
     "test": "babel src/ -d build/ && jest build/test",
     "build": "babel src/ -d build/",
-    "flow": "flow",
+    "flow": "flow check --max-workers 2",
     "lint": "./node_modules/.bin/eslint src",
     "ci_validate": "npm run lint && npm run flow && npm run test"
   },

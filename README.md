@@ -43,9 +43,37 @@ import `run-query`, assert the `query user` command, and distinguish Windows
 exit code 1 from errors; tests of `run-last` do not establish that behavior.
 
 The unchanged Flow 0.124 executable is x86_64 on macOS and cannot start on an
-ARM Mac without a supported runtime. A passing build, lint and functional suite
-does not replace `ci_validate`: qualify Flow on a supported isolated host before
-release. The legacy Drone Node 10 builder and Windows/Linux installers require
-their own delivery validation; these local tests do not run the installed agent
-or contact a VMPower service. Keep dependency updates at least seven days old
-and verify their public registry dates and integrity before accepting a new lock.
+ARM Mac without a supported runtime. `npm run flow` now runs the full foreground
+`flow check --max-workers 2`; it does not start the default background server.
+A passing build, lint and functional suite does not replace `ci_validate`.
+The Linux source-qualification job runs that complete command with a timeout,
+separate Flow temporary directory, and cleanup on success, failure or signal.
+No Flow ignores or tests are removed. Keep dependency updates at least seven
+days old and verify their public registry dates and integrity before accepting
+a new lock.
+
+## CI and binary delivery
+
+Pull requests to `master` run the GitHub Linux source-qualification job on Node
+24.22.1. It installs the exact lock without package scripts or audit uploads,
+then runs build, lint, full Flow and functional tests in a container with no
+network. A real transport negative control verifies that namespace before
+testing. Tests additionally deny Node transports and machine agent-config
+reads; notification pipes, processes and provider calls remain synthetic.
+
+Drone's ordinary branch pushes, pull requests and `master` merges run only the
+modern source-validation step. Every legacy packaging and Azure publishing
+step requires both the `tag` event and a `refs/tags/v*` reference. A release tag
+is an explicit binary-delivery event; do not create one as part of source
+integration. This follows Drone's [combined event/ref conditions](https://docs.drone.io/pipeline/docker/syntax/conditions/).
+The legacy Node 10/nexe/Chocolatey distribution steps are retained, but remain
+unqualified and must be modernized and tested before binary delivery. Node 10
+cannot parse the new development UUID dependency and npm 6 ignores overrides;
+a failed build is never a publishing safeguard.
+
+These checks do not run an installed customer agent. Windows/Linux installer,
+service lifecycle, and actual user-session behavior require separate delivery
+validation. In particular, the current query fixture's stderr `error` event
+does not model real stderr text (`data`); that pre-existing behavior is not
+qualified by the query tests. Do not describe these tests as complete Windows
+error-handling proof.
