@@ -11,7 +11,8 @@ These are the instructions for developing this package. Only follow these if you
 Use Node 18.20.8 with npm 10, or Node 24.22.1 with npm 11, for the
 validated development toolchain. npm must support the scoped dependency
 override; do not regenerate this lock with npm 6. The agent's runtime
-dependency ranges, application version and production source are unchanged.
+dependency ranges and application version are unchanged. The process readers
+now return explicit errors when collection fails, as covered below.
 
 ```bash
 # Install dependencies
