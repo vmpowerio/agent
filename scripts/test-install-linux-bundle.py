@@ -150,6 +150,54 @@ class InstallerTests(unittest.TestCase):
         (self.bundle/'app/index.js').write_text('tampered')
         with self.assertRaises(ValueError):self.install()
         self.assertEqual(self.system.calls,[])
+    def test_source_swapped_during_copy_is_rejected_before_service_changes(self):
+        unit,exe,conf=self.legacy();self.system=FakeSystem(True,True)
+        original_copy=installer.shutil.copytree;swapped=[]
+        def copy_swapped_source(src,dst,*args,**kwargs):
+            if Path(src)==self.bundle and not swapped:
+                app=self.bundle/'app/index.js';app.write_bytes(b'// substituted nonexecuted payload\n')
+                manifest=json.loads((self.bundle/'bundle-manifest.json').read_text())
+                manifest['files']['app/index.js']=installer.stage.digest(app.read_bytes())
+                (self.bundle/'bundle-manifest.json').write_text(json.dumps(manifest));swapped.append(True)
+            return original_copy(src,dst,*args,**kwargs)
+        with mock.patch.object(installer.shutil,'copytree',side_effect=copy_swapped_source):
+            with self.assertRaisesRegex(ValueError,'Copied bundle manifest'):self.install()
+        self.assertEqual(self.system.calls,[('account',)])
+        self.assertTrue(self.system.active and self.system.enabled)
+        self.assertEqual(unit.read_bytes(),installer.LEGACY_UNIT)
+        self.assertEqual(exe.read_bytes(),b'old executable fixture')
+        self.assertEqual(conf.read_bytes(),self.config)
+        self.assertFalse((self.root/'opt/vmpower-agent/releases'/self.expected).exists())
+    def test_writable_input_is_sealed_before_publish_without_mutating_input(self):
+        (self.bundle/'app/index.js').chmod(0o666);(self.bundle/'runtime/node').chmod(0o777)
+        self.bundle.chmod(0o777)
+        original={str(p.relative_to(self.bundle)):(p.stat().st_mode,installer.stage.digest(p.read_bytes()) if p.is_file() else None) for p in [self.bundle,*self.bundle.rglob('*')]}
+        original_rename=installer.os.rename;observed=[]
+        def observe_publication(src,dst,*args,**kwargs):
+            staged=Path(src)
+            self.assertEqual(stat.S_IMODE(staged.parent.stat().st_mode),0o700)
+            for p in [staged,*staged.rglob('*')]:
+                self.assertFalse(p.is_symlink())
+                self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o755 if p.is_dir() or p==staged/'runtime/node' else 0o644)
+            self.assertEqual(installer.stage.digest((staged/'bundle-manifest.json').read_bytes()),self.expected)
+            observed.append(True);return original_rename(src,dst,*args,**kwargs)
+        with mock.patch.object(installer.os,'rename',side_effect=observe_publication):self.install()
+        self.assertEqual(observed,[True])
+        after={str(p.relative_to(self.bundle)):(p.stat().st_mode,installer.stage.digest(p.read_bytes()) if p.is_file() else None) for p in [self.bundle,*self.bundle.rglob('*')]}
+        self.assertEqual(after,original)
+    def test_symlink_introduced_during_copy_cannot_touch_external_file(self):
+        external=self.root/'external';external.write_bytes(b'synthetic external fixture');external.chmod(0o600)
+        original_copy=installer.shutil.copytree;swapped=[]
+        def copy_with_link(src,dst,*args,**kwargs):
+            if Path(src)==self.bundle and not swapped:
+                app=self.bundle/'app/index.js';app.unlink();app.symlink_to(external);swapped.append(True)
+            return original_copy(src,dst,*args,**kwargs)
+        with mock.patch.object(installer.shutil,'copytree',side_effect=copy_with_link):
+            with self.assertRaisesRegex(ValueError,'symlink'):self.install()
+        self.assertEqual(external.read_bytes(),b'synthetic external fixture')
+        self.assertEqual(stat.S_IMODE(external.stat().st_mode),0o600)
+        self.assertEqual(self.system.calls,[('account',)])
+        self.assertFalse((self.root/'opt/vmpower-agent/releases'/self.expected).exists())
     def test_default_cli_has_no_apply_authority(self):
         result=subprocess.run([sys.executable,str(Path(__file__).with_name('install-linux-bundle.py')),'install'],capture_output=True)
         self.assertNotEqual(result.returncode,0);self.assertIn(b'No changes made',result.stderr)

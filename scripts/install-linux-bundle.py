@@ -99,6 +99,16 @@ def restore(path,old):
     else: atomic_write(path,*old)
 
 
+def seal_private_release(root):
+    # Call only while the copy is below a private (0700) staging directory.
+    entries=[root,*root.rglob('*')]
+    if any(p.is_symlink() for p in entries): raise ValueError('Copied bundle symlink is not qualified')
+    for p in entries:
+        if p.is_dir(): p.chmod(0o755)
+        elif p.is_file(): p.chmod(0o755 if p==root/'runtime/node' else 0o644)
+        else: raise ValueError('Unsupported copied bundle file')
+
+
 def install(bundle,expected,incoming=None,root=Path('/'),system=None):
     system=system or System()
     manifest=stage.verify_bundle(bundle)
@@ -127,18 +137,21 @@ def install(bundle,expected,incoming=None,root=Path('/'),system=None):
     if release.is_symlink(): raise ValueError('Refusing symlink release')
     system.destination(release)
     if release.exists():
+        # Previously installed releases must already be protected; do not race
+        # a writer by hashing a writable tree and only then repairing its modes.
+        for p in release.rglob('*'): system.destination(p)
         if hashlib.sha256((release/'bundle-manifest.json').read_bytes()).hexdigest()!=expected: raise ValueError('Retained release mismatch')
         stage.verify_bundle(release)
     else:
         temporary=Path(tempfile.mkdtemp(prefix='.stage-',dir=releases))
         try:
-            shutil.copytree(bundle,temporary/'bundle')
+            shutil.copytree(bundle,temporary/'bundle',symlinks=True)
+            seal_private_release(temporary/'bundle')
+            if hashlib.sha256((temporary/'bundle/bundle-manifest.json').read_bytes()).hexdigest()!=expected:
+                raise ValueError('Copied bundle manifest does not match approved SHA256')
             stage.verify_bundle(temporary/'bundle')
             os.rename(temporary/'bundle',release)
         finally: shutil.rmtree(temporary)
-    for p in [release,*release.rglob('*')]:
-        if p.is_dir(): p.chmod(0o755)
-        else: p.chmod(0o755 if p==release/'runtime/node' else 0o644)
     if not config.exists():
         # Exclusive creation: a concurrent configuration is never replaced.
         config.parent.mkdir(parents=True,exist_ok=True)
