@@ -54,8 +54,10 @@ a new lock.
 
 ## CI and binary delivery
 
-Pull requests to `master` run the GitHub Linux source-qualification job on Node
-24.22.1. It installs the exact lock without package scripts or audit uploads,
+Branch pushes and pull requests to `master` run the GitHub Linux source-qualification
+job on Node 24.22.1. A supported-host push check can qualify Flow before opening
+the PR when the local architecture cannot run its pinned executable. The job
+checks out the exact source head and installs the lock without package scripts or audit uploads,
 then runs build, lint, full Flow and functional tests in a container with no
 network. A real transport negative control verifies that namespace before
 testing. Tests additionally deny Node transports and machine agent-config
