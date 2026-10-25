@@ -1,0 +1,33 @@
+name: Agent source qualification
+
+on:
+  push:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.22.1
+          registry-url: https://registry.npmjs.org
+      - name: Install exact public lock without package scripts
+        run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+      - name: Full isolated source qualification
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --cpus 2 --memory 2g --pids-limit 128 \
+            --user "$(id -u):$(id -g)" --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            -e HOME=/tmp -e CI=true -v "$PWD:/work" -w /work \
+            node:24.22.1-bookworm-slim sh -c \
+            'node scripts/ci-network-control.cjs && sh scripts/ci-validate.sh'

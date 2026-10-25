@@ -6,7 +6,7 @@
   "scripts": {
     "test": "babel src/ -d build/ && jest build/test",
     "build": "babel src/ -d build/",
-    "flow": "flow",
+    "flow": "flow check --max-workers 2",
     "lint": "./node_modules/.bin/eslint src",
     "ci_validate": "npm run lint && npm run flow && npm run test"
   },
@@ -24,11 +24,20 @@
     "@babel/preset-env": "^7.9.6",
     "@babel/preset-flow": "^7.9.0",
     "babel-eslint": "^10.1.0",
-    "babel-jest": "^26.0.1",
+    "babel-jest": "^27.5.1",
     "eslint": "^7.0.0",
     "eslint-plugin-flowtype": "^4.7.0",
     "eslint-plugin-jest": "^23.11.0",
     "flow-bin": "^0.124.0",
-    "jest": "^26.0.1"
+    "jest": "^27.5.1",
+    "node-notifier": "8.0.2"
+  },
+  "jest": {
+    "testEnvironment": "jsdom"
+  },
+  "overrides": {
+    "node-notifier": {
+      "uuid": "11.1.1"
+    }
   }
 }
