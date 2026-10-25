@@ -1,28 +1,29 @@
-"""Validate the hosted runner's temporary directory before touching its paths."""
+"""Anchor hosted fixture paths to this loaded helper's verified checkout layout."""
 import os
-from pathlib import Path, PurePosixPath, PureWindowsPath
-import re
+from pathlib import Path
+import stat
 
 
-def validate_runner_temp(value, windows=False):
-    # The admitted images use absolute paths ending in _temp. Accept other
-    # ordinary directory names/drive letters without allowing traversal, URI,
-    # device/UNC paths, control characters or ambiguous normalized aliases.
-    if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_:/\\ -]+',value):
-        raise ValueError('Invalid hosted runner temporary directory')
-    parsed=(PureWindowsPath if windows else PurePosixPath)(value)
-    if not parsed.is_absolute() or parsed.name!='_temp' or str(parsed)!=value:
-        raise ValueError('Absolute canonical hosted temporary directory required')
-    if windows and not re.fullmatch(r'[A-Za-z]:',parsed.drive):
-        raise ValueError('Local hosted runner drive required')
-    if not windows and ('\\' in value or ':' in value or value.startswith('//')):
-        raise ValueError('Local hosted runner path required')
-    return value
+def checkout_temp(helper):
+    # Default actions/checkout on both admitted images is <work>/agent/agent.
+    # Derive from code location, never RUNNER_TEMP, argv or the working directory.
+    checkout=helper.parent.parent
+    if (not helper.is_absolute() or helper.name!='native_fixture_paths.py' or
+            helper.parent.name!='scripts' or checkout.name!='agent' or
+            checkout.parent.name!='agent'):
+        raise ValueError('Expected agent checkout helper layout')
+    return checkout.parent.parent/'_temp'
 
 
 def runner_output():
-    raw=validate_runner_temp(os.environ.get('RUNNER_TEMP'),os.name=='nt')
-    directory=Path(raw)
+    helper=Path(__file__)
+    directory=checkout_temp(helper)
+    info=helper.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or helper.resolve(strict=True)!=helper:
+        raise ValueError('Linked or nonregular loaded helper')
+    # Only compare external strings; neither selects an I/O or executable path.
+    if os.environ.get('RUNNER_TEMP')!=str(directory):
+        raise ValueError('Runner temporary directory does not match checkout')
     if directory.resolve(strict=True)!=directory or not directory.is_dir():
         raise ValueError('Linked or missing hosted temporary directory')
     return directory/'vmpower-native'
