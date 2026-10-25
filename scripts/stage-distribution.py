@@ -98,7 +98,7 @@ def verify_bundle(root):
     if any(p.is_symlink() for p in root.rglob('*')):
         raise ValueError('Bundle symlink is not qualified')
     manifest = json.loads((root / 'bundle-manifest.json').read_text())
-    actual = {str(p.relative_to(root)): digest(p.read_bytes()) for p in root.rglob('*')
+    actual = {p.relative_to(root).as_posix(): digest(p.read_bytes()) for p in root.rglob('*')
               if p.is_file() and p != root / 'bundle-manifest.json'}
     if actual != manifest['files']:
         raise ValueError('Bundle contents differ from the manifest')
@@ -147,7 +147,7 @@ def stage(repo, modules, archive, target, output):
                     'sourceLockSha256':digest(lock_bytes),'minimumPlatform':pins['targets'][target]['minimum'],
                     'applicationVersion':json.loads((repo/'package.json').read_text())['version'],
                     'productionPackages':[{'path':loc,'name':v[0],'version':v[1],'lockIntegrity':v[2]} for loc,v in sorted(nodes.items())],
-                    'files':{str(p.relative_to(root)):digest(p.read_bytes()) for p in sorted(root.rglob('*')) if p.is_file()},
+                    'files':{p.relative_to(root).as_posix():digest(p.read_bytes()) for p in sorted(root.rglob('*')) if p.is_file()},
                     'qualification':'Staged bytes only; native execution, installer/service and release acceptance are separate.'}
         (root/'bundle-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
         verify_bundle(root)

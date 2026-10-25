@@ -168,6 +168,24 @@ function Get-ManagedPaths {
     return @{Prefix=(Join-Path $env:ProgramFiles 'VMPower\Agent');Config='C:\ProgramData\vmpower\vmpower.conf'}
 }
 
+function Wait-StableServiceChild([string]$Name,[string]$Executable) {
+    $first=$null;$stableSince=$null;$deadline=[DateTime]::UtcNow.AddSeconds(15)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $service=Get-CimInstance Win32_Service -Filter ("Name='"+$Name+"'")
+        $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$service.ProcessId) | Where-Object { $_.ExecutablePath -ieq $Executable })
+        if ($children.Count -ne 1) {
+            if ($first) { throw 'Service child exited during startup' }
+        } elseif (-not $first) {
+            $first=$children[0].ProcessId;$stableSince=[DateTime]::UtcNow
+        } else {
+            if ($children[0].ProcessId -ne $first) { throw 'Service child restarted during startup' }
+            if (([DateTime]::UtcNow-$stableSince).TotalSeconds -ge 5) { return }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw 'Stable service child was not observed'
+}
+
 function Install-AgentBundle([string]$Source, [string]$Expected, [string]$Wrapper, [string]$IncomingJson) {
     $pins = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '../distribution/nssm-pins.json') | ConvertFrom-Json
     Assert-NoReparsePoint $Wrapper
@@ -230,6 +248,7 @@ function Install-AgentBundle([string]$Source, [string]$Expected, [string]$Wrappe
         if (-not $previous -or $previous.Active) {
             $null=Invoke-CheckedNative $installedWrapper @('start',$serviceName)
             if ((Get-Service -Name $serviceName).Status -ne 'Running') { throw 'Service failed to start' }
+            Wait-StableServiceChild $serviceName $node
         }
     } catch {
         try {

@@ -1,29 +1,41 @@
-# Proposed native qualification; not scheduled or run
+# Native qualification candidate; not dispatched or run locally
 
-Root review and CI/budget admission precede workflow changes or a push. Use one
-disposable Linux x64 runner and one disposable Windows x64 runner, with explicit
-timeouts, read-only repository permissions, no customer/provider secrets, no
-release event, and no artifact publishing. Download only the pinned public Node
-and NSSM inputs and public npm packages before enforcing outbound isolation.
-Record exact runner OS, kernel/libc or Windows build and PowerShell version.
-These runner results do not establish Windows 10/Server 2016, oldest Linux baseline,
-or customer-host compatibility; each untested platform stays Unknown.
+Root review and CI/budget admission precede a push. The prepared workflow
+`.github/workflows/native-qualification.yml` has one standard Ubuntu 24.04 x64 job
+(15 minutes) and one standard Windows 2025 x64 job (20 minutes). It runs on this
+delivery branch/master pushes and master PRs, with read-only contents permission,
+no customer/provider secrets, no dispatch/release/tag event and no binary artifact
+publishing. Existing source/CodeQL jobs remain separate and count toward admission.
+Only sanitized JSON qualification receipts are uploaded for three days; package
+bytes, synthetic configuration, login rows and raw service environments are excluded.
+Download only the pinned public Node and NSSM inputs and public npm packages before
+enforcing outbound isolation. Record exact runner OS, kernel/libc or Windows build
+and PowerShell version. These results do not establish Windows 10/Server 2016,
+oldest Linux baseline or customer-host compatibility; untested platforms stay Unknown.
 
-1. Check out the exact reviewed candidate. Perform the established source gates
-   and fresh integrity-checked `npm ci`, compile and stage that lock's production
+1. Check out the exact reviewed candidate. The existing source workflow retains
+   full Flow/build/lint/source tests. Each native job performs fresh
+   integrity-checked `npm ci`, compiles and stages that lock's production
    closure. Verify the supplied Node archive hash and per-file bundle manifest.
    On Windows verify both NSSM archive and extracted x64 hashes; retain bundled
-   source and licence in the sanitized evidence set. Never execute a mirror or
+   source-file and licence hashes in sanitized evidence. Never execute a mirror or
    a version chosen dynamically by Chocolatey.
 2. Run packaging negative tests and the matching native-bundle smoke with the
    staged runtime. Run Linux filesystem transaction tests and Windows real native
    argv/ACL tests. Negative controls must prove changed bytes, missing credentials,
    links, writable executable ACLs and injected start failure are rejected.
-3. Before any real service installation, establish OS-level outbound denial and
-   independently prove a direct TCP attempt is denied. Preserve any runner control
-   channel needed for cleanup, and identify its exception explicitly; do not call
-   the service isolated solely because an application mock rejects network calls.
-   Abort before service creation if isolation cannot be safely established.
+3. Before any real service installation, establish service-scoped OS outbound
+   denial. Linux rules reject nonloopback traffic for the dedicated service UID;
+   a direct Node socket probe runs as that UID and must increment the IPv4 rejection
+   counter. IPv6 rejection rules are installed/read back, but IPv6 Internet
+   reachability is not claimed. Windows rules block nonloopback ranges for every
+   exact staged/installed Node path, across all profiles. Profiles must already
+   be enabled; no global profile or runner control-channel settings change. A
+   direct probe must connect to owned loopback and receive access-denied externally;
+   a timeout alone fails Windows qualification. The only external probe is bare
+   TCP to 1.1.1.1:443, carrying no payload or credentials, that must be denied.
+   This does not claim the whole runner is offline. Abort before service creation
+   if isolation cannot be established.
 4. Assert the fixed VMPower service names, install paths, account and configuration
    do not already exist. Use the fixed production names only on this disposable
    host, so the tested path matches the installer. No customer resources exist on
@@ -31,8 +43,11 @@ or customer-host compatibility; each untested platform stays Unknown.
 5. Install synthetic JSON credentials from stdin, including quotes/backslashes,
    with a synthetic noncustomer host. Start the actual systemd/NSSM service and
    identify its real staged Node child and command line without printing secrets.
-   Confirm the exact config reader succeeds, native collection reaches the report
-   caller, and network access fails at the OS boundary. Verify account, executable
+   Confirm the exact config reader succeeds and native collection reaches the
+   report caller. Receiver validation checks synthetic headers, body shape,
+   platform and version; only counts/timestamps persist. Ephemeral-runner login
+   rows are not logged or uploaded. Require two reports across 60 seconds from the
+   same expected Node child. Verify account, executable
    permissions, configuration permissions and wrapper identity.
 6. Stop and confirm the child PID exits; restart; upgrade to a second fixture
    manifest without supplying credentials and compare configuration byte hashes.
@@ -40,10 +55,14 @@ or customer-host compatibility; each untested platform stays Unknown.
    a stopped/disabled upgrade too. Inject a broken entrypoint that really fails
    startup, assert rollback to previous runtime and running state, and compare
    config hashes. A service-manager status alone may hide a restarting failed child;
-   observe child stability and exit state across the configured restart interval.
+   installer startup checks child identity/stability for five seconds, and the
+   longer reporting test independently proves progress beyond service-manager state.
 7. Uninstall through the new installer; verify service and child absence and retained
    config/release hashes. Separately test migration from synthetic legacy unit/NSSM
-   settings and package-manager ownership. Preserve published legacy artifacts.
+   settings using pinned Node24 fixture bytes. This does not execute a legacy
+   published Node10 binary or qualify Debian/Chocolatey package-manager ownership;
+   those migration checks remain required before replacing public packages.
+   Preserve published legacy artifacts.
    A legacy uninstaller may delete config and must not be used as cleanup.
 8. In finally/always cleanup, remove only the synthetic resources recorded by this
    run and restore runner network rules. Verify no service, Node/NSSM child, config,
@@ -54,3 +73,20 @@ or customer-host compatibility; each untested platform stays Unknown.
 No binary signing identity, release version, customer OS inventory, customer
 installation or artifact download has been qualified by this plan. A successful
 native run is an input to a separately authorized release and consumer readback.
+
+Implementation: `prepare-native-inputs.py` binds public vendor bytes and labels
+synthetic upgrade/crash variants; `native-report-fixture.cjs` owns the loopback
+receiver; `qualify-native-linux.py` and `qualify-native-windows.ps1` enforce empty
+host guards, real service lifecycle and cleanup. Each has a separate cleanup entry
+point in an `always()` workflow step. Failure before ownership cannot authorize
+cleanup of a pre-existing service/configuration. Windows PowerShell parsing, native
+ACLs and both service lifecycles remain UNRUN on the development Mac; workflow
+existence is not acceptance. No local server or service is started.
+
+Staging prevention: manifest names must use POSIX separators on every host.
+Mac/Linux staging cannot qualify Windows path handling; the Windows job stages
+and verifies the real Windows bundle before any installer/service operation.
+
+Primary behavior references: [systemd service startup semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
+[Windows program/address firewall rules](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule?view=windowsserver2025-ps),
+and [standard GitHub runner labels](https://github.com/actions/runner-images).

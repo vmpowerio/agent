@@ -1,9 +1,11 @@
 # Node 24 delivery candidate
 
 This additive candidate stages a runtime bundle and provides explicit-apply,
-offline installers for qualification. Nothing invokes the installers automatically.
-It does not replace the legacy installers, upload files, create a release tag, or
-change published download URLs. The source-qualification workflow is unchanged.
+offline installers for qualification. The native workflow invokes them only on
+guarded disposable runners. It does not replace legacy installers, publish binary
+artifacts, create a release tag, or
+change published download URLs. The source-qualification workflow is unchanged;
+a separate native workflow is prepared for reviewed, budget-admitted execution.
 
 Use the official, unmodified Node 24.22.1 binary with the compiled application
 and the production nodes from the committed lock. This avoids a new bundler,
@@ -151,9 +153,11 @@ The bounded hosted qualification plan is in `native-qualification.md`. Do not in
 authenticated caller continuity or installation correctness from denial tests or
 mocked service calls: execute each changed positive lifecycle path on its actual
 native service manager, with synthetic configuration and enforced outbound denial.
-The candidate's startup check currently observes service-manager state; it does
-not yet prove a stable application child or successful collection/reporting.
-The native lifecycle test must establish those before installation is qualified.
+Startup additionally requires the same expected Node child to stay alive for five
+seconds. This detects immediate crashes/restarts; it does not prove reporting.
+Native lifecycle tests separately require two scheduled reports across 60 seconds
+to the owned loopback receiver, from the same child. These hosted tests have not
+run merely because their workflow exists.
 
 The [public installation documentation](https://help.vmpower.com/VMPower%20agent%20%5Bbeta%5D/Installation/)
 still references legacy Debian/Chocolatey packages and manual archive URLs with

@@ -25,6 +25,7 @@ class FakeSystem:
     def destination(self,p): pass # Test roots are deliberately owned by the test user.
     def account(self): self.calls.append(('account',));return 12345
     def config_owner(self,p,gid): self.owners.append((p,gid))
+    def stable_child(self,executable): self.calls.append(('stable-child',str(executable)))
     def call(self,*args,allowed=(0,)):
         self.calls.append(args);op=args[1]
         if op=='is-active': result=0 if self.active else 3
@@ -88,6 +89,20 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue((self.root/'etc/vmpower.conf').exists())
         self.assertTrue((self.root/'opt/vmpower-agent/releases'/self.expected).exists())
         self.assertFalse(self.system.active or self.system.enabled)
+    def test_unstable_child_restores_previous_service(self):
+        unit,exe,conf=self.legacy();self.system=FakeSystem(True,True)
+        self.system.stable_child=mock.Mock(side_effect=RuntimeError('unstable child'))
+        with self.assertRaisesRegex(RuntimeError,'unstable'):self.install()
+        self.assertEqual(unit.read_bytes(),installer.LEGACY_UNIT)
+        self.assertEqual(exe.read_bytes(),b'old executable fixture')
+        self.assertTrue(self.system.active)
+    def test_native_child_check_rejects_restarting_pid(self):
+        responses=[SimpleNamespace(stdout=b'101\n'),SimpleNamespace(stdout=b'102\n')]
+        with mock.patch.object(installer.subprocess,'run',side_effect=responses),mock.patch.object(installer.os,'readlink',return_value='/qualified/node'),mock.patch.object(installer.time,'sleep'),mock.patch.object(installer.time,'monotonic',side_effect=range(50)):
+            with self.assertRaisesRegex(RuntimeError,'not stable'):installer.System().stable_child(Path('/qualified/node'))
+    def test_native_child_check_rejects_wrong_executable(self):
+        with mock.patch.object(installer.subprocess,'run',return_value=SimpleNamespace(stdout=b'101\n')),mock.patch.object(installer.os,'readlink',return_value='/other/node'),mock.patch.object(installer.time,'sleep'),mock.patch.object(installer.time,'monotonic',side_effect=range(50)):
+            with self.assertRaisesRegex(RuntimeError,'not observed'):installer.System().stable_child(Path('/qualified/node'))
     def test_uninstall_keeps_configuration_and_releases(self):
         self.install();before=(self.root/'etc/vmpower.conf').read_bytes()
         installer.uninstall(self.root,self.system)

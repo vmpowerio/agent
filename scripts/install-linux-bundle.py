@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 sys.dont_write_bytecode=True
@@ -60,6 +61,19 @@ class System:
             raise ValueError('Service account requires a dedicated vmpower group')
         return account.pw_gid
     def config_owner(self,p,gid): os.chown(p,0,gid)
+    def stable_child(self,executable):
+        # SCM "active" alone can describe an immediately crashing/restarting app.
+        initial=None;stable_since=None;deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            result=subprocess.run(['systemctl','show','vmpower.service','--property=MainPID','--value'],capture_output=True,timeout=5,check=True)
+            pid=int(result.stdout.strip())
+            try: correct=pid>1 and os.readlink('/proc/'+str(pid)+'/exe')==str(executable)
+            except FileNotFoundError: correct=False
+            if initial is not None and (pid!=initial or not correct): raise RuntimeError('Service child is not stable')
+            if correct and initial is None: initial=pid;stable_since=time.monotonic()
+            if correct and time.monotonic()-stable_since>=5: return
+            time.sleep(0.5)
+        raise RuntimeError('Stable service child was not observed')
 
 
 def atomic_write(path,data,mode):
@@ -145,6 +159,7 @@ def install(bundle,expected,incoming=None,root=Path('/'),system=None):
         if start:
             system.call('systemctl','start','vmpower.service')
             system.call('systemctl','is-active','--quiet','vmpower.service')
+            system.stable_child(release/'runtime/node')
     except Exception:
         system.call('systemctl','stop','vmpower.service',allowed=(0,5))
         if not was_enabled: system.call('systemctl','disable','vmpower.service',allowed=(0,1))

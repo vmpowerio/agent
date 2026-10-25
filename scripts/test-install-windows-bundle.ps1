@@ -59,6 +59,13 @@ try {
     $null=Ensure-Config $config '{}'
     Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($config)) -eq [Convert]::ToBase64String($before)) 'Configuration overwritten'
     Assert-Restricted $config $false
+    $badAcl=Get-Acl -LiteralPath $config
+    $ordinaryUsers=New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'
+    $badAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($ordinaryUsers,'Read','Allow')))
+    Set-Acl -LiteralPath $config -AclObject $badAcl
+    Assert-Throws { Assert-Restricted $config $false }
+    $null=Ensure-Config $config $null
+    Assert-Restricted $config $false
     $hardlink=Join-Path (Split-Path $config) 'linked.conf'
     $null=New-Item -ItemType HardLink -Path $hardlink -Target $config
     Assert-Throws { Ensure-Config $config $json }

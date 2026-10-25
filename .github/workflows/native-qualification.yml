@@ -1,0 +1,110 @@
+name: Agent native qualification
+
+on:
+  push:
+    branches: [master, security/agent-node24-delivery-20261025]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  QUALIFIED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  linux-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.22.1
+          registry-url: https://registry.npmjs.org
+      - name: Install exact public lock and compile
+        run: |
+          npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+          npm run build
+          python3 scripts/test-stage-distribution.py
+          python3 scripts/test-install-linux-bundle.py
+          node scripts/test-native-report-fixture.cjs
+      - name: Stage pinned official runtime and labeled fixtures
+        run: python3 scripts/prepare-native-inputs.py --output "$RUNNER_TEMP/vmpower-native"
+      - name: Real native bundle CLI
+        run: '"$RUNNER_TEMP/vmpower-native/bundle/runtime/node" scripts/native-bundle-smoke.cjs "$RUNNER_TEMP/vmpower-native/bundle"'
+      - name: Isolated systemd lifecycle and progress
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
+            python3 scripts/qualify-native-linux.py --output "$RUNNER_TEMP/vmpower-native"
+      - name: Always reconcile owned fixture cleanup
+        if: always()
+        run: |
+          if [ -f scripts/qualify-native-linux.py ]; then
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
+              python3 scripts/qualify-native-linux.py --cleanup --output "$RUNNER_TEMP/vmpower-native"
+          fi
+      - name: Sanitized qualification receipts only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-linux-receipts
+          path: ${{ runner.temp }}/vmpower-native/evidence/*.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  windows-native:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.22.1
+          registry-url: https://registry.npmjs.org
+      - name: Install exact public lock and compile
+        run: |
+          npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-stage-distribution.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/test-native-report-fixture.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stage pinned official runtime and NSSM provenance
+        run: |
+          python scripts/prepare-native-inputs.py --output "$env:RUNNER_TEMP\vmpower-native"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Real native bundle CLI and installer argv ACL controls
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'vmpower-native'
+          & "$root\bundle\runtime\node.exe" scripts/native-bundle-smoke.cjs "$root\bundle"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $prepared=Get-Content -Raw "$root\evidence\prepared.json" | ConvertFrom-Json
+          & scripts/test-install-windows-bundle.ps1 -Bundle "$root\bundle" -ExpectedManifestSha256 $prepared.bundles.bundle -NssmExe "$root\nssm.exe"
+      - name: Isolated NSSM lifecycle and progress
+        run: '& scripts/qualify-native-windows.ps1 -Output "$env:RUNNER_TEMP\vmpower-native"'
+      - name: Always reconcile owned fixture cleanup
+        if: always()
+        run: |
+          if (Test-Path scripts/qualify-native-windows.ps1) {
+            & scripts/qualify-native-windows.ps1 -CleanupOnly -Output "$env:RUNNER_TEMP\vmpower-native"
+          }
+      - name: Sanitized qualification receipts only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-windows-receipts
+          path: ${{ runner.temp }}/vmpower-native/evidence/*.json
+          if-no-files-found: ignore
+          retention-days: 3
