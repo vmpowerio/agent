@@ -197,6 +197,7 @@ class ServiceFixtureTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'AMBIGUOUS_OPT_JOURNAL'):self.native.normalize_opt(out,owned)
             self.assertEqual(journal.read_text(),'{"run":"other"}');self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
 
+@unittest.skipIf(os.name=='nt','Linux /proc receiver identity; Windows has separate native process identity checks')
 class ReceiverIdentityTests(unittest.TestCase):
     def test_exact_owned_receiver_only(self):
         native=load('receiver_identity','qualify-native-linux.py')

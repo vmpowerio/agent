@@ -146,6 +146,15 @@ tests invoke the actual helpers with a copied Node executable, adverse paths and
 preserved sentinels; their fake loopback receiver opens no socket. These checks
 do not replace new exact-head native lifecycle and CodeQL qualification.
 
+Cross-platform test placement: the first path-hardening successor incorrectly
+selected its Linux `/proc` cleanup test on Windows, where importing the Linux
+harness fails on `pwd` before native staging. This was a test-placement mistake,
+not a product or vendor failure. Classify OS-specific imports before adding a
+test to a shared entrypoint; verify selection on both platform families. This
+test remains selected on Linux/macOS and uses the existing Windows-only POSIX
+exclusion. All 14 actual JavaScript helper controls and the real Windows process
+identity, cleanup and lifecycle checks remain mandatory on Windows.
+
 Primary behavior references: [systemd service startup semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
 [Windows program/address firewall rules](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule?view=windowsserver2025-ps),
 and [standard GitHub runner labels](https://github.com/actions/runner-images).
