@@ -106,6 +106,19 @@ on the official NSSM HTTP503 before service tests. Offline tests exercise that
 retry path and its rejection controls; only a subsequent admitted native run can
 qualify actual provider availability and lifecycle behavior.
 
+Diagnostic prevention: when a guarded native phase fails, record enough fixed
+metadata to distinguish the failed prerequisite from later behavior. The Linux
+receipt now records only uid/gid/mode and classification for `/`, `/opt`, `/etc`,
+`/etc/systemd`, `/etc/systemd/system`, `/usr` and `/usr/bin` before the unchanged
+destination guard. It does not repair ownership/permissions or inspect arbitrary
+paths. The first runuser failure and the second run's exact offending ancestor
+remain Unknown until their own evidence supports a narrower conclusion.
+Windows PowerShell5.1 JSON arrays are assigned directly rather than wrapped in
+`@(...)`; the real native echo still must preserve all six argument values,
+including empty and quoted arguments. Failures report only count/type/index.
+The product quoting function is unchanged. Platform checks remain pending;
+offline inspection is not evidence of successful native quoting or service use.
+
 Primary behavior references: [systemd service startup semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
 [Windows program/address firewall rules](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule?view=windowsserver2025-ps),
 and [standard GitHub runner labels](https://github.com/actions/runner-images).

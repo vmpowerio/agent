@@ -3,6 +3,7 @@
 import hashlib,importlib.util,io,json,os,ssl,stat,subprocess,sys,tempfile,unittest,urllib.error
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 sys.dont_write_bytecode=True
 def load(name,file):
     spec=importlib.util.spec_from_file_location(name,Path(__file__).with_name(file))
@@ -97,5 +98,25 @@ class ServiceFixtureTests(unittest.TestCase):
         failure=subprocess.CompletedProcess([],1,'','Direct nonloopback denial not established: CONNECTED')
         with mock.patch.object(self.native.subprocess,'run',return_value=failure):
             with self.assertRaisesRegex(RuntimeError,'EXTERNAL_DENIAL_UNPROVEN'):self.native.egress_probe(Path('/fixed/node'),Path('/fixed/probe'),1234)
+    def test_metadata_reads_only_fixed_ancestors_and_classifies_without_mutation(self):
+        expected=['/','/opt','/etc','/etc/systemd','/etc/systemd/system','/usr','/usr/bin'];reads=[]
+        def metadata(p):
+            name=str(p);reads.append(name)
+            self.assertIn(name,expected)
+            if name=='/etc/systemd/system':raise FileNotFoundError()
+            mode=stat.S_IFLNK|0o777 if name=='/etc/systemd' else stat.S_IFDIR|(0o775 if name=='/etc' else 0o755)
+            return SimpleNamespace(st_uid=1001 if name=='/opt' else 0,st_gid=0,st_mode=mode)
+        with mock.patch.object(Path,'lstat',metadata),mock.patch.object(Path,'chmod',side_effect=AssertionError('must not chmod')),mock.patch.object(Path,'read_bytes',side_effect=AssertionError('must not read content')),mock.patch.object(self.native.os,'chown',side_effect=AssertionError('must not chown')):
+            rows=self.native.fixed_ancestor_metadata()
+        self.assertEqual(reads,expected)
+        self.assertEqual([row['classification'] for row in rows],['PROTECTED','NOT_ROOT_OWNED','GROUP_OR_WORLD_WRITABLE','LINKED','MISSING','PROTECTED','PROTECTED'])
+        for row in rows:self.assertLessEqual(set(row),{'path','uid','gid','mode','classification'})
+    def test_metadata_io_error_does_not_become_protected(self):
+        with mock.patch.object(Path,'lstat',side_effect=PermissionError('synthetic unreadable metadata')):
+            with self.assertRaises(PermissionError):self.native.fixed_ancestor_metadata()
+    def test_actual_fixed_metadata_has_no_content_or_extra_paths(self):
+        rows=self.native.fixed_ancestor_metadata()
+        self.assertEqual([row['path'] for row in rows],list(self.native.FIXED_ANCESTORS))
+        for row in rows:self.assertLessEqual(set(row),{'path','uid','gid','mode','classification'})
 
 if __name__=='__main__':unittest.main()

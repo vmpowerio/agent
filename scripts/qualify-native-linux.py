@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """Real systemd lifecycle on an otherwise empty ephemeral Ubuntu runner only."""
-import argparse,hashlib,importlib.util,json,os,platform,pwd,grp,shlex,shutil,signal,subprocess,sys,time
+import argparse,hashlib,importlib.util,json,os,platform,pwd,grp,shlex,shutil,signal,stat,subprocess,sys,time
 from pathlib import Path
 sys.dont_write_bytecode=True
 ROOT=Path(__file__).resolve().parents[1]
 SERVICE_FIXTURE=Path('/opt/vmpower-agent-qualification')
 MANAGED=[Path('/opt/vmpower-agent'),Path('/etc/vmpower.conf'),Path('/etc/systemd/system/vmpower.service'),Path('/usr/bin/vmpower'),SERVICE_FIXTURE]
+FIXED_ANCESTORS=('/', '/opt', '/etc', '/etc/systemd', '/etc/systemd/system', '/usr', '/usr/bin')
+def fixed_ancestor_metadata():
+    """Read only an explicit public filesystem metadata allowlist; never repair it."""
+    rows=[]
+    for name in FIXED_ANCESTORS:
+        try:info=Path(name).lstat()
+        except FileNotFoundError:
+            rows.append({'path':name,'classification':'MISSING'});continue
+        classification=('LINKED' if stat.S_ISLNK(info.st_mode) else
+                        'NOT_ROOT_OWNED' if info.st_uid!=0 else
+                        'GROUP_OR_WORLD_WRITABLE' if info.st_mode & 0o022 else 'PROTECTED')
+        rows.append({'path':name,'uid':info.st_uid,'gid':info.st_gid,
+                     'mode':format(stat.S_IMODE(info.st_mode),'04o'),'classification':classification})
+    return rows
 def guard():
     if not (sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted' and os.environ.get('ImageOS')=='ubuntu24'):
         raise RuntimeError('Root on admitted ephemeral Ubuntu24 runner required')
@@ -118,6 +132,7 @@ def qualify(out):
     phases=[];result={'status':'FAIL','head':prepared['head'],'platform':platform.platform(),'image':os.environ.get('ImageOS'),'imageVersion':os.environ.get('ImageVersion'),'architecture':platform.machine(),'libc':platform.libc_ver(),'phases':phases,'customerOSCompatibility':'Unknown'}
     try:
         spec=importlib.util.spec_from_file_location('installer',ROOT/'scripts/install-linux-bundle.py');installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        result['fixedAncestorMetadata']=fixed_ancestor_metadata()
         installer.System().destination(SERVICE_FIXTURE)
         result['serviceFixture']=service_fixture(out/'bundle',hashes['bundle'],ROOT/'scripts/native-egress-probe.cjs',SERVICE_FIXTURE)
         command('useradd','--system','--user-group','--no-create-home','--home-dir','/nonexistent','--shell','/usr/sbin/nologin','vmpower')

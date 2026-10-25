@@ -46,9 +46,13 @@ try {
     # Execute a harmless native argv echo, not the application or a shell.
     $argv=@('space value','inner"quote','trailing\','','$(not-a-command); & |','unicode é')
     $echo=& $realNative $node (@('-e','process.stdout.write(JSON.stringify(process.argv.slice(1)))','--')+$argv)
-    $actual=@(ConvertFrom-Json $echo)
-    Assert-True ($actual.Count -eq $argv.Count) 'Native argument count changed'
-    for ($i=0;$i -lt $argv.Count;$i++) { Assert-True ($actual[$i] -ceq $argv[$i]) 'Native argument changed' }
+    # PS5.1 sends a decoded array as one pipeline object; @() nests that array.
+    # Direct assignment preserves its six entries, including the empty string.
+    $actual=ConvertFrom-Json -InputObject $echo
+    $actualType=if ($null -eq $actual) {'null'} else {$actual.GetType().FullName}
+    $actualCount=if ($null -eq $actual) {0} else {$actual.Count}
+    Assert-True ($actualCount -eq $argv.Count) ('Native argument count changed; expected='+$argv.Count+' actual='+$actualCount+' type='+$actualType)
+    for ($i=0;$i -lt $argv.Count;$i++) { Assert-True ($actual[$i] -ceq $argv[$i]) ('Native argument changed; index='+$i+' type='+$actualType) }
     Assert-Throws { Quote-NativeArgument "invalid`nargument" }
     Assert-Throws { Assert-ConfigJson '{}' }
     Assert-Throws { Assert-ConfigJson '' }
