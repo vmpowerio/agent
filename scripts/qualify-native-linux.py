@@ -3,6 +3,7 @@
 import argparse,hashlib,importlib.util,json,os,platform,pwd,grp,shlex,shutil,signal,stat,subprocess,sys,tempfile,time
 from pathlib import Path
 sys.dont_write_bytecode=True
+from native_fixture_paths import require_output
 ROOT=Path(__file__).resolve().parents[1]
 SERVICE_FIXTURE=Path('/opt/vmpower-agent-qualification')
 MANAGED=[Path('/opt/vmpower-agent'),Path('/etc/vmpower.conf'),Path('/etc/systemd/system/vmpower.service'),Path('/usr/bin/vmpower'),SERVICE_FIXTURE]
@@ -120,8 +121,7 @@ def receiver_matches(out,executable,argv):
     node=str(out/'bundle/runtime/node')
     return executable==node and argv==[node.encode(),str(ROOT/'scripts/native-report-fixture.cjs').encode(),b'']
 def cleanup(out):
-    guard();journal=out/'owned.json'
-    if out!=(Path(os.environ['RUNNER_TEMP'])/'vmpower-native').resolve():raise RuntimeError('Fixed runner fixture directory required')
+    guard();out=require_output(out);journal=out/'owned.json'
     if not journal.exists():return {'status':'NO_OWNED_RESOURCES'}
     owned=json.loads(journal.read_text())
     if owned['run']!=os.environ['GITHUB_RUN_ID'] or owned['paths']!=[str(p) for p in MANAGED]:raise RuntimeError('Cleanup ownership mismatch')
@@ -171,7 +171,7 @@ def cleanup(out):
     return complete_cleanup(out,owned,result)
 def qualify(out):
     guard()
-    if out!=(Path(os.environ['RUNNER_TEMP'])/'vmpower-native').resolve():raise RuntimeError('Fixed runner fixture directory required')
+    out=require_output(out)
     if (out/'owned.json').exists():raise RuntimeError('Existing ownership journal requires cleanup reconciliation')
     # Do not read any pre-existing configuration: reject the entire occupied host.
     if any(p.exists() or p.is_symlink() for p in MANAGED):raise RuntimeError('Managed destination already exists')
@@ -258,5 +258,5 @@ def qualify(out):
     print(json.dumps({'nativeLifecycle':'PASS','phases':len(phases),'cleanup':result['cleanup']['status']}))
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);parser.add_argument('--cleanup',action='store_true');args=parser.parse_args();guard()
-    if args.cleanup:cleanup(args.output.resolve())
-    else:qualify(args.output.resolve())
+    if args.cleanup:cleanup(args.output)
+    else:qualify(args.output)

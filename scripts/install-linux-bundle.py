@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import shutil
 import stat
 import subprocess
@@ -111,9 +112,14 @@ def seal_private_release(root):
 
 def install(bundle,expected,incoming=None,root=Path('/'),system=None):
     system=system or System()
+    if not isinstance(expected,str) or not re.fullmatch(r'[0-9a-f]{64}',expected):
+        raise ValueError('Expected exactly 64 lowercase hexadecimal SHA256 characters')
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise ValueError('Bundle input must be a real directory, not a symlink')
     manifest=stage.verify_bundle(bundle)
     manifest_bytes=(bundle/'bundle-manifest.json').read_bytes()
-    if hashlib.sha256(manifest_bytes).hexdigest()!=expected or manifest['target']!='linux-x64':
+    approved_digest=hashlib.sha256(manifest_bytes).hexdigest()
+    if approved_digest!=expected or manifest['target']!='linux-x64':
         raise ValueError('Expected qualified Linux bundle manifest hash')
     prefix=root/'opt/vmpower-agent';unit=root/'etc/systemd/system/vmpower.service';launcher=root/'usr/bin/vmpower';config=root/'etc/vmpower.conf'
     for p in [prefix,prefix/'rollback',prefix/'releases',unit,launcher,config]:
@@ -133,7 +139,7 @@ def install(bundle,expected,incoming=None,root=Path('/'),system=None):
     if old_launcher: atomic_write(backup/'vmpower',*old_launcher)
     if old_unit: atomic_write(backup/'vmpower.service',*old_unit)
     releases=prefix/'releases';releases.mkdir(exist_ok=True);releases.chmod(0o755)
-    release=releases/expected
+    release=releases/approved_digest
     if release.is_symlink(): raise ValueError('Refusing symlink release')
     system.destination(release)
     if release.exists():
@@ -155,7 +161,9 @@ def install(bundle,expected,incoming=None,root=Path('/'),system=None):
     if not config.exists():
         # Exclusive creation: a concurrent configuration is never replaced.
         config.parent.mkdir(parents=True,exist_ok=True)
-        fd=os.open(config,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o640)
+        # Keep new bytes private even if root's primary/inherited group is not
+        # the service group. Grant group read only after verified ownership below.
+        fd=os.open(config,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
         with os.fdopen(fd,'wb') as f: f.write(raw);f.flush();os.fsync(f.fileno())
     system.config_owner(config,gid);config.chmod(0o640)
     was_active=system.call('systemctl','is-active','--quiet','vmpower.service',allowed=(0,3,4))==0
@@ -163,7 +171,7 @@ def install(bundle,expected,incoming=None,root=Path('/'),system=None):
     if was_active: system.call('systemctl','stop','vmpower.service')
     start=old_unit is None or was_active
     try:
-        executable='/opt/vmpower-agent/releases/'+expected
+        executable='/opt/vmpower-agent/releases/'+approved_digest
         atomic_write(launcher,('#!/bin/sh\n'+MARKER+'exec "'+executable+'/runtime/node" "'+executable+'/app/index.js" "$@"\n').encode(),0o755)
         text=MARKER+'[Unit]\nDescription=VMPower agent\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/bin/vmpower\nUser=vmpower\nRestart=on-failure\nRestartSec=10\nNoNewPrivileges=true\n\n[Install]\nWantedBy=multi-user.target\n'
         atomic_write(unit,text.encode(),0o644)

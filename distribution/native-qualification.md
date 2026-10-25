@@ -155,6 +155,35 @@ test remains selected on Linux/macOS and uses the existing Windows-only POSIX
 exclusion. All 14 actual JavaScript helper controls and the real Windows process
 identity, cleanup and lifecycle checks remain mandatory on Windows.
 
+Python boundary prevention: compare the actual configured CodeQL language matrix
+with changed source languages. The first canonical scan added Python after the
+PR had analyzed only JavaScript/TypeScript and Actions; successful analysis jobs
+did not mean zero alerts. Inspect the resulting alerts and their actual dataflows.
+The Linux installer now checks SHA256 syntax before reading the bundle and
+derives release paths from the matching computed digest. New configuration is
+created0600, written and closed before assigning the already-verified dedicated
+service group and0640. Ordinary bundle-directory selection remains supported;
+linked bundle roots are rejected, and copied integrity/sealing checks remain.
+The hosted fixture rejects relative, traversing, linked or ambiguously normalized
+runner temporary paths before filesystem effects. Offline adverse controls must
+reach the old boundary itself, not fail first on a different host/platform guard.
+These controls do not establish that every detector finding is exploitable or
+resolved; exact-head Python scanning and both native platforms remain required.
+
+Canonical path syntax does not establish the intended privileged fixture root.
+The first shared Python validator still accepted any existing `_temp` directory;
+returning that environment-selected path propagated it into journal and executable
+selection. The subsequent PR scan reported 32 taint sinks, not 32 distinct proven
+exploits. Anchor this harness to its loaded, canonical, regular, single-link helper
+at `<work>/agent/agent/scripts/native_fixture_paths.py`, matching the default
+checkout layout observed on both admitted images. Derive sibling `<work>/_temp`
+from that location and compare `RUNNER_TEMP` and output arguments without using
+them to form I/O or executable paths. Reject alternate existing roots and linked
+helper/checkout paths. This restriction applies to the hosted fixture, not to
+legitimate customer installer bundle locations. Test rejection through the actual
+prepare, qualification and cleanup entrypoints before effects; native Windows
+and Linux execution and exact-head findings still require hosted verification.
+
 Primary behavior references: [systemd service startup semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
 [Windows program/address firewall rules](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule?view=windowsserver2025-ps),
 and [standard GitHub runner labels](https://github.com/actions/runner-images).
