@@ -1,7 +1,7 @@
 jest.mock("child_process");
 import childProcess from "child_process";
 
-module.exports.mockSpawnWithLines = (lines, errorLines = []) => {
+module.exports.mockSpawnWithLines = (lines, errorLines = [], exitCode = errorLines.length === 0 ? 0 : 1) => {
   childProcess.spawn.mockImplementation(() => {
     const stdoutOnHandlers = [];
     const stderrOnHandlers = [];
@@ -33,7 +33,7 @@ module.exports.mockSpawnWithLines = (lines, errorLines = []) => {
             handler(line);
           });
         });
-        handler(errorLines.length === 0 ? 0 : 1);
+        handler(exitCode);
       },
     };
   });
