@@ -1,0 +1,13 @@
+{
+  "version": "2.24-101-g897c7ad",
+  "url": "https://nssm.cc/ci/nssm-2.24-101-g897c7ad.zip",
+  "archiveSha256": "99f5045fffbffb745d67fe3a065a953c4a3d9c253b868892d9b685b0ee7d07b8",
+  "publisherSha1": "ca2f6782a05af85facf9b620e047b01271edd11d",
+  "x64Member": "nssm-2.24-101-g897c7ad/win64/nssm.exe",
+  "x64Sha256": "eee9c44c29c2be011f1f1e43bb8c3fca888cb81053022ec5a0060035de16d848",
+  "source": "Source files bundled in this exact publisher archive under src/; independent Git archive read was unavailable (HTTP503).",
+  "sourceBinaryReproducibility": "Unknown; no reproducible build or signature verification claimed",
+  "license": "Public domain; publisher page and archive README Licence section",
+  "support": "Publisher recommends this prerelease for modern Windows; current maintenance commitment and comprehensive advisory coverage are Unknown",
+  "advisoryQualification": "CVE-2025-41686 names Phoenix Contact DaUM insecure NSSM executable permissions, not every NSSM2.24-101 binary. Protected executable directories and ACL validation remain mandatory. No zero-vulnerability claim."
+}

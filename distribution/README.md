@@ -1,8 +1,9 @@
 # Node 24 delivery candidate
 
-This additive scaffold stages a runtime bundle. It does not install a service,
-replace existing installers, upload files, create a release tag, or change the
-published download URLs. The existing source-qualification workflow is unchanged.
+This additive candidate stages a runtime bundle and provides explicit-apply,
+offline installers for qualification. Nothing invokes the installers automatically.
+It does not replace the legacy installers, upload files, create a release tag, or
+change published download URLs. The source-qualification workflow is unchanged.
 
 Use the official, unmodified Node 24.22.1 binary with the compiled application
 and the production nodes from the committed lock. This avoids a new bundler,
@@ -70,7 +71,7 @@ disposable hosted runners with synthetic configuration and outbound denial:
 - Fresh install, upgrade, rollback and uninstall preserve the configuration
   contract and restrict its file permissions/ACLs.
 - Start the actual service, verify it is running, stop it, and prove its child
-  processes are gone. Use distinct test service names and guaranteed cleanup.
+  processes are gone. Use clean disposable hosts and guaranteed cleanup.
 - Exercise synthetic successful and failed `last` / `query user` collection
   through the real report caller without contacting a customer endpoint.
 - Validate native package contents, architecture, runtime/library requirements,
@@ -81,11 +82,78 @@ postinstall does not create the service user or enable the service. The Windows
 installer overwrites configuration and its uninstaller deletes it. These legacy
 scripts are unqualified and remain unchanged by this scaffold.
 
-Windows also needs an explicitly pinned, native-tested service wrapper. The
+Windows uses the pinned NSSM 2.24-101-g897c7ad wrapper. The
 [NSSM publisher](https://nssm.cc/download) warns that modern Windows needs build
 2.24-101 or newer rather than stable 2.24. Selecting a replacement such as WinSW
 adds a service migration and runtime dependency that needs separate qualification.
 Do not silently substitute an arbitrary Chocolatey wrapper version.
+
+`nssm-pins.json` binds the exact publisher HTTPS archive, its published SHA-1,
+and independently computed archive/executable SHA-256. The archive includes source
+and a README public-domain licence. An independent Git archive fetch returned 503;
+no reproducible binary/source equivalence or Authenticode validation is claimed.
+The publisher lists this development build from 2017; age alone proves neither
+safety nor vulnerability. Current support commitments and comprehensive advisory
+coverage remain unknown. [CERT VDE advisory VDE-2025-063](https://certvde.com/de/advisories/VDE-2025-063/)
+and CVE-2025-41686 concern Phoenix Contact DaUM's writable NSSM installation files,
+not a universal finding against this executable. The installer therefore protects
+both executable files and their parent directories. Native ACL tests are required;
+this is not a zero-vulnerability assertion.
+
+## Additive installer candidate
+
+Both installers require an explicitly supplied, qualified bundle-manifest SHA-256.
+They download nothing. First-install configuration arrives as JSON on standard
+input only. Existing configuration takes precedence even over invalid replacement
+input; missing input never overwrites it. Uninstall has no purge option and retains
+configuration, releases and rollback files. No credential is placed in service
+arguments. Credentials must come from a protected delivery mechanism, not a literal
+shell command or committed fixture.
+
+- `install-linux-bundle.py` preserves service `vmpower.service`, `/usr/bin/vmpower`
+  and `/etc/vmpower.conf`. It creates/reuses a non-root `vmpower` service account,
+  sets configuration root:vmpower 0640, retains content-addressed releases under
+  `/opt/vmpower-agent`, and saves previous launcher/unit bytes in a root-only
+  rollback directory. It rejects linked or writable managed destinations. A failed
+  start restores the previous launcher/unit and previous active/enabled state.
+- `install-windows-bundle.ps1` preserves NSSM service `vmpoweragent`, LocalSystem
+  and `C:\ProgramData\vmpower\vmpower.conf`. It puts executables below Program Files
+  with Administrators/SYSTEM write access and Users read/execute only. Configuration
+  permits Administrators/SYSTEM only. Reparse points and hardlinked configuration
+  are refused. It preserves the prior NSSM Application/AppDirectory/AppParameters
+  and wrapper path on failure, and retains all release and wrapper files.
+  Custom service identities are refused rather than reset. The current source
+  reader resolves `\ProgramData` on the working-directory drive: non-C Program
+  Files drives therefore fail closed pending explicit compatibility qualification.
+
+Invoke only on a qualified disposable native host, with the respective `--apply`
+or `-Apply` switch. No-apply invocation fails without changing the machine. Linux
+requires root; Windows requires an elevated x64 PowerShell process. Successful
+upgrades preserve stopped/disabled state; a new service starts automatically.
+The wrappers are not Debian/Chocolatey replacement packages and no package version
+has been selected. Before customer use, qualify legacy package-manager coexistence
+so an old uninstaller cannot remove the new service or retained configuration.
+
+Offline checks:
+
+```sh
+python3 scripts/test-stage-distribution.py
+python3 scripts/test-install-linux-bundle.py
+```
+
+The Linux installer tests replace account/service operations and exercise real
+temporary files. Windows `test-install-windows-bundle.ps1` takes `-Bundle`,
+`-ExpectedManifestSha256`, `-NssmExe` and tests real native argument passing and ACLs
+on temporary files with all service operations replaced. It is prepared, not run
+on macOS. Neither suite proves service lifecycle.
+
+The bounded hosted qualification plan is in `native-qualification.md`. Do not infer
+authenticated caller continuity or installation correctness from denial tests or
+mocked service calls: execute each changed positive lifecycle path on its actual
+native service manager, with synthetic configuration and enforced outbound denial.
+The candidate's startup check currently observes service-manager state; it does
+not yet prove a stable application child or successful collection/reporting.
+The native lifecycle test must establish those before installation is qualified.
 
 The [public installation documentation](https://help.vmpower.com/VMPower%20agent%20%5Bbeta%5D/Installation/)
 still references legacy Debian/Chocolatey packages and manual archive URLs with
