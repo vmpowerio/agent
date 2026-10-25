@@ -201,6 +201,35 @@ class InstallerTests(unittest.TestCase):
     def test_default_cli_has_no_apply_authority(self):
         result=subprocess.run([sys.executable,str(Path(__file__).with_name('install-linux-bundle.py')),'install'],capture_output=True)
         self.assertNotEqual(result.returncode,0);self.assertIn(b'No changes made',result.stderr)
+    def test_digest_syntax_rejected_before_any_bundle_read(self):
+        for value in [None,123,'a'*63,'a'*65,'A'*64,'../'+'a'*61,'/'+'a'*63,'a'*63+'\n','a'*63+'\\']:
+            with self.subTest(value=value),mock.patch.object(installer.stage,'verify_bundle',side_effect=AssertionError('Bundle must not be read')):
+                with self.assertRaisesRegex(ValueError,'64 lowercase'):installer.install(self.bundle,value,self.config,self.root,self.system)
+        self.assertEqual(self.system.calls,[])
+    def test_new_configuration_is_private_before_service_group_assignment(self):
+        original=self.system.config_owner;observed=[]
+        def owner(p,gid):
+            observed.append(stat.S_IMODE(p.stat().st_mode))
+            self.assertEqual(p.read_bytes(),installer.config_bytes(None,self.config))
+            self.assertEqual(observed[-1],0o600)
+            return original(p,gid)
+        self.system.config_owner=owner;self.install()
+        self.assertEqual(observed,[0o600]);self.assertEqual(stat.S_IMODE((self.root/'etc/vmpower.conf').stat().st_mode),0o640)
+    def test_group_assignment_failure_leaves_new_configuration_private(self):
+        self.system.config_owner=mock.Mock(side_effect=RuntimeError('synthetic ownership failure'))
+        with self.assertRaisesRegex(RuntimeError,'ownership failure'):self.install()
+        conf=self.root/'etc/vmpower.conf'
+        self.assertEqual(stat.S_IMODE(conf.stat().st_mode),0o600)
+        self.assertEqual(json.loads(conf.read_bytes()),json.loads(self.config))
+        self.assertEqual(self.system.calls,[('account',)])
+    def test_symlink_bundle_root_rejected_before_read_or_system_changes(self):
+        alias=self.fixture.root/'input-alias';alias.symlink_to(self.bundle,target_is_directory=True)
+        with self.assertRaisesRegex(ValueError,'real directory'):installer.install(alias,self.expected,self.config,self.root,self.system)
+        self.assertEqual(self.system.calls,[]);self.assertEqual(list(self.root.iterdir()),[])
+    def test_legitimate_arbitrary_bundle_input_name_is_preserved(self):
+        chosen=self.fixture.root/'another selected bundle';self.bundle.rename(chosen);self.bundle=chosen
+        result=self.install();self.assertEqual(result['release'],self.expected)
+        self.assertEqual(json.loads((self.root/'etc/vmpower.conf').read_bytes()),json.loads(self.config))
 
 
 if __name__=='__main__':unittest.main()

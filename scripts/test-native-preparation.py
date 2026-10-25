@@ -10,6 +10,52 @@ def load(name,file):
     spec=importlib.util.spec_from_file_location(name,Path(__file__).with_name(file))
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 prepare=load('prepare','prepare-native-inputs.py')
+import native_fixture_paths as fixture_paths
+
+class RunnerPathTests(unittest.TestCase):
+    def test_ordinary_absolute_host_paths_preserved(self):
+        for value,windows in [('/home/runner/work/_temp',False),('/private/owned runner/_temp',False),('D:\\a\\_temp',True),('C:\\owned runner\\_temp',True)]:
+            with self.subTest(value=value):self.assertEqual(fixture_paths.validate_runner_temp(value,windows),value)
+    def test_ambiguous_or_traversing_environment_rejected(self):
+        for value in [None,'','_temp','../_temp','/tmp/../_temp','/tmp/./_temp','/tmp//_temp','//host/_temp','/tmp/other','/tmp/_temp\n','file:///tmp/_temp']:
+            with self.subTest(value=value),self.assertRaises(ValueError):fixture_paths.validate_runner_temp(value)
+        for value in ['C:relative\\_temp','D:\\a\\..\\_temp','D:/a/_temp','\\\\host\\share\\_temp','\\\\?\\D:\\a\\_temp']:
+            with self.subTest(value=value),self.assertRaises(ValueError):fixture_paths.validate_runner_temp(value,True)
+    def test_output_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d).resolve()/'_temp';directory.mkdir()
+            with mock.patch.dict(os.environ,{'RUNNER_TEMP':str(directory)}):
+                expected=directory/'vmpower-native';self.assertEqual(fixture_paths.require_output(expected),expected)
+                for value in [directory/'other',Path('vmpower-native')]:
+                    with self.assertRaisesRegex(ValueError,'Fixed runner'):fixture_paths.require_output(value)
+    def test_preparation_rejects_normalized_environment_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d).resolve()/'_temp';directory.mkdir();out=directory/'vmpower-native'
+            env={'RUNNER_TEMP':str(directory/'..'/'_temp'),'GITHUB_ACTIONS':'true','RUNNER_ENVIRONMENT':'github-hosted'}
+            with mock.patch.dict(os.environ,env),mock.patch.object(prepare.platform,'system',return_value='Linux'),mock.patch.object(prepare.platform,'machine',return_value='x86_64'),mock.patch.object(prepare,'download',side_effect=AssertionError('No download allowed')):
+                with self.assertRaises(ValueError):prepare.main(out)
+            self.assertFalse(out.exists())
+
+@unittest.skipIf(os.name=='nt','POSIX symlink and Linux harness entrypoint controls')
+class PosixRunnerPathTests(unittest.TestCase):
+    def test_symlinked_runner_temp_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d).resolve();real=root/'real';real.mkdir();alias=root/'_temp';alias.symlink_to(real,target_is_directory=True)
+            with mock.patch.dict(os.environ,{'RUNNER_TEMP':str(alias)}):
+                with self.assertRaisesRegex(ValueError,'Linked'):fixture_paths.runner_output()
+            self.assertEqual(list(real.iterdir()),[])
+    def test_cleanup_rejects_environment_alias_before_journal_read(self):
+        native=load('native_cleanup_paths','qualify-native-linux.py')
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d).resolve()/'_temp';directory.mkdir();out=directory/'vmpower-native'
+            with mock.patch.dict(os.environ,{'RUNNER_TEMP':str(directory/'..'/'_temp')}),mock.patch.object(native,'guard'),mock.patch.object(native,'command',side_effect=AssertionError('No system calls allowed')):
+                with self.assertRaises(ValueError):native.cleanup(out)
+    def test_qualification_rejects_environment_alias_before_host_inspection(self):
+        native=load('native_qualify_paths','qualify-native-linux.py')
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d).resolve()/'_temp';directory.mkdir();out=directory/'vmpower-native'
+            with mock.patch.dict(os.environ,{'RUNNER_TEMP':str(directory/'..'/'_temp')}),mock.patch.object(native,'guard'),mock.patch.object(native,'MANAGED',[]),mock.patch.object(native,'command',side_effect=AssertionError('No system calls allowed')):
+                with self.assertRaises(ValueError):native.qualify(out)
 
 class DownloadTests(unittest.TestCase):
     def setUp(self):

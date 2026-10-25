@@ -3,6 +3,7 @@
 import argparse,hashlib,importlib.util,json,os,platform,shutil,socket,sys,time,urllib.error,urllib.request,zipfile
 from pathlib import Path
 sys.dont_write_bytecode=True
+from native_fixture_paths import require_output
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('stage',ROOT/'scripts/stage-distribution.py')
 stage=importlib.util.module_from_spec(spec);spec.loader.exec_module(stage)
@@ -31,7 +32,7 @@ def download(url,destination,digest):
     destination.write_bytes(raw)
 def main(out):
     if os.environ.get('GITHUB_ACTIONS')!='true' or os.environ.get('RUNNER_ENVIRONMENT')!='github-hosted':raise ValueError('Ephemeral hosted runner required')
-    if out!=(Path(os.environ['RUNNER_TEMP'])/'vmpower-native').resolve():raise ValueError('Fixed runner fixture directory required')
+    out=require_output(out)
     target={'Linux':'linux-x64','Windows':'win-x64'}[platform.system()]
     if platform.machine().lower() not in ('x86_64','amd64'):raise ValueError('Native x64 required')
     out.mkdir(exist_ok=False);(out/'evidence').mkdir();pins=json.loads((ROOT/'distribution/runtime-pins.json').read_text())
@@ -68,4 +69,4 @@ def main(out):
     (out/'evidence/prepared.json').write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps({'prepared':True,'target':target,'fixtureVariants':2}))
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);main(parser.parse_args().output.resolve())
+    parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);main(parser.parse_args().output)
