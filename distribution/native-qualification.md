@@ -1,4 +1,4 @@
-# Native qualification candidate; not dispatched or run locally
+# Native qualification contract
 
 Root review and CI/budget admission precede a push. The prepared workflow
 `.github/workflows/native-qualification.yml` has one standard Ubuntu 24.04 x64 job
@@ -79,9 +79,9 @@ synthetic upgrade/crash variants; `native-report-fixture.cjs` owns the loopback
 receiver; `qualify-native-linux.py` and `qualify-native-windows.ps1` enforce empty
 host guards, real service lifecycle and cleanup. Each has a separate cleanup entry
 point in an `always()` workflow step. Failure before ownership cannot authorize
-cleanup of a pre-existing service/configuration. Windows PowerShell parsing, native
-ACLs and both service lifecycles remain UNRUN on the development Mac; workflow
-existence is not acceptance. No local server or service is started.
+cleanup of a pre-existing service/configuration. Native acceptance comes from
+exact-source hosted job/phase/cleanup receipts, never from this development Mac
+or workflow existence. No local server or service is started.
 
 Staging prevention: manifest names must use POSIX separators on every host.
 Mac/Linux staging cannot qualify Windows path handling; the Windows job stages
@@ -118,6 +118,20 @@ Windows PowerShell5.1 JSON arrays are assigned directly rather than wrapped in
 including empty and quoted arguments. Failures report only count/type/index.
 The product quoting function is unchanged. Platform checks remain pending;
 offline inspection is not evidence of successful native quoting or service use.
+
+Ephemeral Ubuntu `/opt` normalization: the hosted image was observed with the
+exact root0:0 directory mode0777, which the production destination guard correctly
+rejects. The qualification harness alone may temporarily change that exact
+baseline to0755, after recording its original/temporary mode in the atomic owned
+journal. It rejects different ownership, symlinks, other modes or ambiguous
+journals; the product installer and its destination guard remain unchanged.
+No other ancestor is changed. The existing finally/always cleanup restores0777
+only after all owned service, child, file, firewall, receiver and input cleanup
+flags pass. An incomplete cleanup defers restoration and fails qualification;
+the same journal is reconciled by the always step, not discarded or replaced.
+Tests use disposable directories and inject phase, journal, permission and
+cleanup failures. Native restoration still requires a new exact-head hosted
+receipt before acceptance; no development-machine `/opt` change is permitted.
 
 Primary behavior references: [systemd service startup semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
 [Windows program/address firewall rules](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule?view=windowsserver2025-ps),

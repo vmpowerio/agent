@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Real systemd lifecycle on an otherwise empty ephemeral Ubuntu runner only."""
-import argparse,hashlib,importlib.util,json,os,platform,pwd,grp,shlex,shutil,signal,stat,subprocess,sys,time
+import argparse,hashlib,importlib.util,json,os,platform,pwd,grp,shlex,shutil,signal,stat,subprocess,sys,tempfile,time
 from pathlib import Path
 sys.dont_write_bytecode=True
 ROOT=Path(__file__).resolve().parents[1]
 SERVICE_FIXTURE=Path('/opt/vmpower-agent-qualification')
 MANAGED=[Path('/opt/vmpower-agent'),Path('/etc/vmpower.conf'),Path('/etc/systemd/system/vmpower.service'),Path('/usr/bin/vmpower'),SERVICE_FIXTURE]
 FIXED_ANCESTORS=('/', '/opt', '/etc', '/etc/systemd', '/etc/systemd/system', '/usr', '/usr/bin')
+OPT_PATH=Path('/opt')
+OPT_CHANGE={'path':'/opt','uid':0,'gid':0,'originalMode':'0777','temporaryMode':'0755'}
 def fixed_ancestor_metadata():
     """Read only an explicit public filesystem metadata allowlist; never repair it."""
     rows=[]
@@ -23,6 +25,41 @@ def fixed_ancestor_metadata():
 def guard():
     if not (sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted' and os.environ.get('ImageOS')=='ubuntu24'):
         raise RuntimeError('Root on admitted ephemeral Ubuntu24 runner required')
+def opt_state():
+    info=OPT_PATH.lstat()
+    return {'directory':stat.S_ISDIR(info.st_mode),'uid':info.st_uid,'gid':info.st_gid,'mode':format(stat.S_IMODE(info.st_mode),'04o')}
+def require_opt_mode(allowed):
+    state=opt_state()
+    if not state['directory'] or state['uid']!=0 or state['gid']!=0 or state['mode'] not in allowed:
+        raise RuntimeError('UNEXPECTED_OPT_BASELINE')
+    return state['mode']
+def normalize_opt(out,owned):
+    guard()
+    if 'optPermissions' in owned:raise RuntimeError('OPT_JOURNAL_ALREADY_EXISTS')
+    if (out/'owned.json').exists() and json.loads((out/'owned.json').read_text())!=owned:
+        raise RuntimeError('AMBIGUOUS_OPT_JOURNAL')
+    require_opt_mode({'0777'})
+    owned['optPermissions']=dict(OPT_CHANGE)
+    write(out/'owned.json',owned) # Atomic intent precedes the only shared-path change.
+    require_opt_mode({'0777'})
+    OPT_PATH.chmod(0o755)
+    require_opt_mode({'0755'})
+    return {'status':'TEMPORARILY_PROTECTED','originalMode':'0777','temporaryMode':'0755'}
+def validate_opt_journal(owned):
+    if 'optPermissions' not in owned:return
+    if owned['optPermissions']!=OPT_CHANGE:raise RuntimeError('AMBIGUOUS_OPT_JOURNAL')
+    require_opt_mode({'0755','0777'})
+def complete_cleanup(out,owned,result):
+    if 'optPermissions' in owned:
+        guard();validate_opt_journal(owned)
+        flags=['serviceAbsent','childrenAbsent','managedFilesAbsent','fixtureInputsRemoved','firewallRulesRemoved','receiverStopped']
+        if result.get('status')!='PASS' or not all(result.get(flag) is True for flag in flags):
+            raise RuntimeError('OPT_RESTORE_DEFERRED_OWNED_CLEANUP_INCOMPLETE')
+        if require_opt_mode({'0755','0777'})=='0755':OPT_PATH.chmod(0o777)
+        require_opt_mode({'0777'})
+        result['optPermissions']={'status':'RESTORED','mode':'0777','afterOwnedCleanup':True}
+    write(out/'evidence/cleanup-linux.json',result)
+    return result
 def command(*args,allowed=(0,),**kwargs):
     result=subprocess.run(args,capture_output=True,text=True,timeout=35,**kwargs)
     if result.returncode not in allowed:raise RuntimeError('Native command failed: '+str(args[0])+' returncode='+str(result.returncode))
@@ -53,7 +90,16 @@ def egress_probe(node,script,port):
             if marker in result.stderr:code=label;break
         raise RuntimeError('EGRESS_PROBE_FAILED code='+code+' returncode='+str(result.returncode))
     return result
-def write(path,value):path.write_text(json.dumps(value,indent=2)+'\n')
+def write(path,value):
+    # Atomic/fsynced journals cannot be partially replaced before normalization.
+    fd,name=tempfile.mkstemp(prefix='.native-json-',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w') as f:
+            os.fchmod(f.fileno(),0o644) # Sanitized evidence stays readable by artifact upload.
+            json.dump(value,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+        os.replace(name,path)
+    finally:
+        if os.path.exists(name):os.unlink(name)
 def wait(check,timeout=15):
     end=time.monotonic()+timeout
     while time.monotonic()<end:
@@ -76,6 +122,7 @@ def cleanup(out):
     if not journal.exists():return {'status':'NO_OWNED_RESOURCES'}
     owned=json.loads(journal.read_text())
     if owned['run']!=os.environ['GITHUB_RUN_ID'] or owned['paths']!=[str(p) for p in MANAGED]:raise RuntimeError('Cleanup ownership mismatch')
+    validate_opt_journal(owned)
     command('systemctl','stop','vmpower.service',allowed=(0,5))
     command('systemctl','disable','vmpower.service',allowed=(0,1))
     survivors=[]
@@ -113,13 +160,14 @@ def cleanup(out):
         if path.name in ['evidence','owned.json']:continue
         if path.is_dir():shutil.rmtree(path)
         else:path.unlink()
-    result={'status':'PASS','serviceAbsent':True,'childrenAbsent':not survivors,'managedFilesAbsent':True,'fixtureInputsRemoved':True,'firewallRulesRemoved':True,'receiverStopped':True}
+    result={'status':'FAIL' if survivors else 'PASS','serviceAbsent':True,'childrenAbsent':not survivors,'managedFilesAbsent':True,'fixtureInputsRemoved':True,'firewallRulesRemoved':True,'receiverStopped':True}
     write(out/'evidence/cleanup-linux.json',result)
     if survivors:raise RuntimeError('Service left children; forced cleanup performed')
-    return result
+    return complete_cleanup(out,owned,result)
 def qualify(out):
     guard()
     if out!=(Path(os.environ['RUNNER_TEMP'])/'vmpower-native').resolve():raise RuntimeError('Fixed runner fixture directory required')
+    if (out/'owned.json').exists():raise RuntimeError('Existing ownership journal requires cleanup reconciliation')
     # Do not read any pre-existing configuration: reject the entire occupied host.
     if any(p.exists() or p.is_symlink() for p in MANAGED):raise RuntimeError('Managed destination already exists')
     if command('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()!='not-found':raise RuntimeError('Service already exists')
@@ -133,6 +181,7 @@ def qualify(out):
     try:
         spec=importlib.util.spec_from_file_location('installer',ROOT/'scripts/install-linux-bundle.py');installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
         result['fixedAncestorMetadata']=fixed_ancestor_metadata()
+        result['optPermissions']=normalize_opt(out,owned)
         installer.System().destination(SERVICE_FIXTURE)
         result['serviceFixture']=service_fixture(out/'bundle',hashes['bundle'],ROOT/'scripts/native-egress-probe.cjs',SERVICE_FIXTURE)
         command('useradd','--system','--user-group','--no-create-home','--home-dir','/nonexistent','--shell','/usr/sbin/nologin','vmpower')

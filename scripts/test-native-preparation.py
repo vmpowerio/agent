@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline native harness regressions: no downloads, sockets, users or services."""
 import hashlib,importlib.util,io,json,os,ssl,stat,subprocess,sys,tempfile,unittest,urllib.error
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 from types import SimpleNamespace
@@ -118,5 +119,82 @@ class ServiceFixtureTests(unittest.TestCase):
         rows=self.native.fixed_ancestor_metadata()
         self.assertEqual([row['path'] for row in rows],list(self.native.FIXED_ANCESTORS))
         for row in rows:self.assertLessEqual(set(row),{'path','uid','gid','mode','classification'})
+    @contextmanager
+    def opt_fixture(self):
+        # Only this disposable directory changes modes. No /opt/Mac ancestor,
+        # account, service, socket, download or root identity is modified.
+        directory=Path(tempfile.mkdtemp(prefix='owned-opt-',dir=self.fixture.root));directory.chmod(0o777)
+        out=Path(tempfile.mkdtemp(prefix='receipt-',dir=self.fixture.root));(out/'evidence').mkdir()
+        owned={'run':'fixture','paths':['fixture'],'firewall':[]}
+        def state():return {'directory':True,'uid':0,'gid':0,'mode':format(stat.S_IMODE(directory.stat().st_mode),'04o')}
+        with mock.patch.object(self.native,'OPT_PATH',directory),mock.patch.object(self.native,'guard'),mock.patch.object(self.native,'opt_state',side_effect=state):
+            yield directory,out,owned
+    def clean_result(self):return dict(status='PASS',serviceAbsent=True,childrenAbsent=True,managedFilesAbsent=True,fixtureInputsRemoved=True,firewallRulesRemoved=True,receiverStopped=True)
+    def test_opt_journal_precedes_mode_change_and_restore_follows_cleanup(self):
+        with self.opt_fixture() as (directory,out,owned):
+            original=Path.chmod;changes=[]
+            def observe(p,mode,*args,**kwargs):
+                self.assertEqual(p,directory);self.assertEqual(json.loads((out/'owned.json').read_text())['optPermissions'],self.native.OPT_CHANGE)
+                changes.append(mode);return original(p,mode,*args,**kwargs)
+            with mock.patch.object(Path,'chmod',observe):
+                self.native.normalize_opt(out,owned)
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o755)
+                result=self.native.complete_cleanup(out,owned,self.clean_result())
+            self.assertEqual(changes,[0o755,0o777]);self.assertEqual(result['optPermissions']['status'],'RESTORED')
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
+    def test_opt_restored_after_injected_qualification_failure(self):
+        with self.opt_fixture() as (directory,out,owned):
+            with self.assertRaisesRegex(RuntimeError,'synthetic phase failure'):
+                try:
+                    self.native.normalize_opt(out,owned)
+                    raise RuntimeError('synthetic phase failure')
+                finally:self.native.complete_cleanup(out,owned,self.clean_result())
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
+    def test_opt_incomplete_cleanup_never_exposes_owned_files(self):
+        with self.opt_fixture() as (directory,out,owned):
+            self.native.normalize_opt(out,owned)
+            incomplete=self.clean_result();incomplete['childrenAbsent']=False
+            with self.assertRaisesRegex(RuntimeError,'RESTORE_DEFERRED'):self.native.complete_cleanup(out,owned,incomplete)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o755)
+            self.native.complete_cleanup(out,owned,self.clean_result())
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
+    def test_opt_wrong_baselines_are_refused_without_write(self):
+        for mode,uid,gid,directory in [('0755',0,0,True),('0775',0,0,True),('0777',1001,0,True),('0777',0,1001,True),('0777',0,0,False)]:
+            with self.subTest(mode=mode,uid=uid,gid=gid,directory=directory),self.opt_fixture() as (target,out,owned):
+                with mock.patch.object(self.native,'opt_state',return_value={'mode':mode,'uid':uid,'gid':gid,'directory':directory}),mock.patch.object(Path,'chmod',side_effect=AssertionError('must not chmod')):
+                    with self.assertRaisesRegex(RuntimeError,'UNEXPECTED_OPT_BASELINE'):self.native.normalize_opt(out,owned)
+                self.assertFalse((out/'owned.json').exists());self.assertEqual(stat.S_IMODE(target.stat().st_mode),0o777)
+    def test_opt_ambiguous_journal_refuses_restoration(self):
+        with self.opt_fixture() as (directory,out,owned):
+            self.native.normalize_opt(out,owned);owned['optPermissions']['originalMode']='0755'
+            with self.assertRaisesRegex(RuntimeError,'AMBIGUOUS_OPT_JOURNAL'):self.native.complete_cleanup(out,owned,self.clean_result())
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o755)
+    def test_opt_interrupted_before_chmod_can_reconcile_original_mode(self):
+        with self.opt_fixture() as (directory,out,owned):
+            with mock.patch.object(Path,'chmod',side_effect=OSError('synthetic chmod failure')):
+                with self.assertRaises(OSError):self.native.normalize_opt(out,owned)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
+            self.native.complete_cleanup(out,json.loads((out/'owned.json').read_text()),self.clean_result())
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
+    def test_opt_always_cleanup_reentry_does_not_repeat_chmod(self):
+        with self.opt_fixture() as (directory,out,owned):
+            self.native.normalize_opt(out,owned)
+            self.native.complete_cleanup(out,owned,self.clean_result())
+            with mock.patch.object(Path,'chmod',side_effect=AssertionError('already restored')):
+                result=self.native.complete_cleanup(out,json.loads((out/'owned.json').read_text()),self.clean_result())
+            self.assertEqual(result['optPermissions']['mode'],'0777')
+    def test_atomic_journal_write_failure_preserves_original(self):
+        with self.opt_fixture() as (directory,out,owned):
+            journal=out/'owned.json';original=json.loads(json.dumps(owned));journal.write_text(json.dumps(original))
+            with mock.patch.object(self.native.json,'dump',side_effect=RuntimeError('synthetic serialization failure')):
+                with self.assertRaises(RuntimeError):self.native.normalize_opt(out,owned)
+            self.assertEqual(json.loads(journal.read_text()),original)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
+            self.assertEqual(sorted(p.name for p in out.iterdir()),['evidence','owned.json'])
+    def test_opt_preexisting_mismatched_journal_is_never_overwritten(self):
+        with self.opt_fixture() as (directory,out,owned):
+            journal=out/'owned.json';journal.write_text('{"run":"other"}')
+            with self.assertRaisesRegex(RuntimeError,'AMBIGUOUS_OPT_JOURNAL'):self.native.normalize_opt(out,owned)
+            self.assertEqual(journal.read_text(),'{"run":"other"}');self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
 
 if __name__=='__main__':unittest.main()
