@@ -59,7 +59,11 @@ function Cleanup-Owned {
     foreach ($process in $survivors) { Stop-Process -Id $process.ProcessId -Force }
     if ($owned.receiverPid) {
         $receiver=Get-CimInstance Win32_Process -Filter ('ProcessId='+$owned.receiverPid)
-        if ($receiver -and $receiver.CommandLine.Contains((Join-Path $Output 'receiver.json'))) { Stop-Process -Id $owned.receiverPid -Force }
+        if ($receiver) {
+            $expected=(Quote-NativeArgument $sourceNode)+' '+(Quote-NativeArgument (Join-Path $PSScriptRoot 'native-report-fixture.cjs'))
+            Assert-True ($receiver.ExecutablePath -ieq $sourceNode -and $receiver.CommandLine -ceq $expected) 'Receiver identity mismatch'
+            Stop-Process -Id $owned.receiverPid -Force
+        }
         $null=Wait-Condition { -not (Get-Process -Id $owned.receiverPid -ErrorAction SilentlyContinue) }
     }
     foreach ($name in $owned.firewallNames) {
@@ -102,7 +106,7 @@ try {
     }
     $receiver=New-Object Diagnostics.Process
     $receiver.StartInfo.FileName=$node
-    $receiver.StartInfo.Arguments=(Quote-NativeArgument (Join-Path $PSScriptRoot 'native-report-fixture.cjs'))+' '+(Quote-NativeArgument (Join-Path $Output 'receiver.json'))
+    $receiver.StartInfo.Arguments=Quote-NativeArgument (Join-Path $PSScriptRoot 'native-report-fixture.cjs')
     $receiver.StartInfo.UseShellExecute=$false;$receiver.StartInfo.CreateNoWindow=$true
     Assert-True ($receiver.Start()) 'Receiver did not start';$owned.receiverPid=$receiver.Id;Save-Json $journal $owned
     $port=Wait-Condition { (Receiver-State).port }

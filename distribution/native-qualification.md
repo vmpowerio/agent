@@ -133,6 +133,19 @@ Tests use disposable directories and inject phase, journal, permission and
 cleanup failures. Native restoration still requires a new exact-head hosted
 receipt before acceptance; no development-machine `/opt` change is permitted.
 
+Fixture path prevention: PR21 CodeQL found that the smoke helper accepted a
+caller-selected manifest root and the receiver accepted an arbitrary output
+filename. Their workflow callers were trusted, but that did not constrain the
+helper itself. Both now derive fixed paths from the actual staged Node executable
+and require the canonical `vmpower-native/bundle/runtime/node[.exe]` layout,
+regular unlinked manifest/app files, and no path arguments. Receiver creation is
+exclusive and subsequent writes retain that descriptor, so replacing its path
+cannot redirect a later write. Cleanup checks the exact owned executable and
+helper command, rather than a substring of the former output argument. Offline
+tests invoke the actual helpers with a copied Node executable, adverse paths and
+preserved sentinels; their fake loopback receiver opens no socket. These checks
+do not replace new exact-head native lifecycle and CodeQL qualification.
+
 Primary behavior references: [systemd service startup semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
 [Windows program/address firewall rules](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule?view=windowsserver2025-ps),
 and [standard GitHub runner labels](https://github.com/actions/runner-images).

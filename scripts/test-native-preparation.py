@@ -197,4 +197,16 @@ class ServiceFixtureTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'AMBIGUOUS_OPT_JOURNAL'):self.native.normalize_opt(out,owned)
             self.assertEqual(journal.read_text(),'{"run":"other"}');self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o777)
 
+class ReceiverIdentityTests(unittest.TestCase):
+    def test_exact_owned_receiver_only(self):
+        native=load('receiver_identity','qualify-native-linux.py')
+        out=Path('/owned/vmpower-native');node=str(out/'bundle/runtime/node')
+        script=str(native.ROOT/'scripts/native-report-fixture.cjs').encode()
+        exact=[node.encode(),script,b'']
+        self.assertTrue(native.receiver_matches(out,node,exact))
+        for executable,argv in [('/other/node',exact),(node,[node.encode(),script+b'.other',b'']),
+            (node,[node.encode(),script,b'extra',b'']),(node,[node.encode(),b'/other/helper',script,b'']),
+            (node,[node.encode(),script,str(out/'receiver.json').encode(),b''])]:
+            with self.subTest(executable=executable,argv=argv):self.assertFalse(native.receiver_matches(out,executable,argv))
+
 if __name__=='__main__':unittest.main()

@@ -116,6 +116,9 @@ def child(expected):
     if pid<2 or os.readlink('/proc/'+str(pid)+'/exe')!=str(expected):raise RuntimeError('Wrong service child')
     return pid
 def dead(pid):return not Path('/proc/'+str(pid)).exists()
+def receiver_matches(out,executable,argv):
+    node=str(out/'bundle/runtime/node')
+    return executable==node and argv==[node.encode(),str(ROOT/'scripts/native-report-fixture.cjs').encode(),b'']
 def cleanup(out):
     guard();journal=out/'owned.json'
     if out!=(Path(os.environ['RUNNER_TEMP'])/'vmpower-native').resolve():raise RuntimeError('Fixed runner fixture directory required')
@@ -135,8 +138,10 @@ def cleanup(out):
     if 'receiverPid' in owned:
         pid=owned['receiverPid']
         try:
-            argv=Path('/proc/'+str(pid)+'/cmdline').read_bytes()
-            if str(out/'receiver.json').encode() in argv:os.kill(pid,signal.SIGTERM)
+            argv=Path('/proc/'+str(pid)+'/cmdline').read_bytes().split(b'\0')
+            if receiver_matches(out,os.readlink('/proc/'+str(pid)+'/exe'),argv):
+                os.kill(pid,signal.SIGTERM)
+            else:raise RuntimeError('RECEIVER_IDENTITY_MISMATCH')
         except (FileNotFoundError,ProcessLookupError):pass
     for rule in owned.get('firewall',[]):
         binary,args=rule[0],rule[1:]
@@ -190,7 +195,7 @@ def qualify(out):
             args=['-m','owner','--uid-owner',str(uid),'!','-d',address,'-m','comment','--comment','VMPOWER_NATIVE_FIXTURE','-j','REJECT']
             owned['firewall'].append([binary,*args]);write(out/'owned.json',owned)
             command(binary,'-w','-I','OUTPUT','1',*args)
-        receiver=subprocess.Popen([str(out/'bundle/runtime/node'),str(ROOT/'scripts/native-report-fixture.cjs'),str(out/'receiver.json')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        receiver=subprocess.Popen([str(out/'bundle/runtime/node'),str(ROOT/'scripts/native-report-fixture.cjs')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         owned['receiverPid']=receiver.pid;write(out/'owned.json',owned)
         port=wait(lambda:state(out)['port'])
         proof=egress_probe(node,SERVICE_FIXTURE/'native-egress-probe.cjs',port)

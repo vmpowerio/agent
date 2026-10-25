@@ -3,8 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const root = path.resolve(process.argv[2]);
-const manifest = JSON.parse(fs.readFileSync(path.join(root, 'bundle-manifest.json'), 'utf8'));
+const paths = require('./native-fixture-paths.cjs').fixturePaths();
+const root = paths.bundle;
+const manifest = JSON.parse(fs.readFileSync(paths.manifest, 'utf8'));
 const expectedPlatform = manifest.target === 'win-x64' ? 'win32' : 'linux';
 assert.equal(process.platform, expectedPlatform, 'Native target execution is required');
 assert.equal(process.arch, 'x64');
@@ -20,7 +21,7 @@ for (const [args, code, expected] of [
   [['--help'], 0, '--virtualMachine'],
   [[], 1, 'required option']
 ]) {
-  const child = spawnSync(process.execPath, ['--require', boundary, path.join(root, 'app/index.js'), ...args], {
+  const child = spawnSync(process.execPath, ['--require', boundary, paths.app, ...args], {
     encoding: 'utf8', timeout: 5000, env, windowsHide: true
   });
   assert.equal(child.error, undefined);

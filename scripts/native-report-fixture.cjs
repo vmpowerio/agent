@@ -15,10 +15,14 @@ if (require.main === module) {
   assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
   assert(['linux', 'win32'].includes(process.platform));
   assert.equal(process.arch, 'x64');
-  const output = process.argv[2];
+  const output = require('./native-fixture-paths.cjs').openReceiverState();
   const state = { pid: process.pid, count: 0, rejected: 0, port: null, firstReportAt: null, lastReportAt: null };
   // Readers retry incomplete JSON; avoid Windows rename/share-delete races.
-  function save() { fs.writeFileSync(output, JSON.stringify(state)); }
+  function save() {
+    const bytes = Buffer.from(JSON.stringify(state));
+    fs.writeSync(output, bytes, 0, bytes.length, 0);
+    fs.ftruncateSync(output, bytes.length);
+  }
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/probe') { res.end('fixture'); return; }
     let raw = ''; let oversized = false;
@@ -35,6 +39,6 @@ if (require.main === module) {
   });
   server.listen(0, '127.0.0.1', () => { state.port = server.address().port; save(); });
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
-    server.close(() => process.exit(0)); server.closeAllConnections();
+    server.close(() => { fs.closeSync(output); process.exit(0); }); server.closeAllConnections();
   });
 }

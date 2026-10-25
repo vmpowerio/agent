@@ -33,10 +33,11 @@ jobs:
           python3 scripts/test-install-linux-bundle.py
           python3 scripts/test-native-preparation.py
           node scripts/test-native-report-fixture.cjs
+          node scripts/test-native-fixture-paths.cjs
       - name: Stage pinned official runtime and labeled fixtures
         run: python3 scripts/prepare-native-inputs.py --output "$RUNNER_TEMP/vmpower-native"
       - name: Real native bundle CLI
-        run: '"$RUNNER_TEMP/vmpower-native/bundle/runtime/node" scripts/native-bundle-smoke.cjs "$RUNNER_TEMP/vmpower-native/bundle"'
+        run: '"$RUNNER_TEMP/vmpower-native/bundle/runtime/node" scripts/native-bundle-smoke.cjs'
       - name: Isolated systemd lifecycle and progress
         run: |
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
@@ -84,6 +85,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/test-native-report-fixture.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/test-native-fixture-paths.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Stage pinned official runtime and NSSM provenance
         run: |
           python scripts/prepare-native-inputs.py --output "$env:RUNNER_TEMP\vmpower-native"
@@ -91,7 +94,7 @@ jobs:
       - name: Real native bundle CLI and installer argv ACL controls
         run: |
           $root=Join-Path $env:RUNNER_TEMP 'vmpower-native'
-          & "$root\bundle\runtime\node.exe" scripts/native-bundle-smoke.cjs "$root\bundle"
+          & "$root\bundle\runtime\node.exe" scripts/native-bundle-smoke.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $prepared=Get-Content -Raw "$root\evidence\prepared.json" | ConvertFrom-Json
           & scripts/test-install-windows-bundle.ps1 -Bundle "$root\bundle" -ExpectedManifestSha256 $prepared.bundles.bundle -NssmExe "$root\nssm.exe"
