@@ -71,9 +71,12 @@ unqualified and must be modernized and tested before binary delivery. Node 10
 cannot parse the new development UUID dependency and npm 6 ignores overrides;
 a failed build is never a publishing safeguard.
 
+Process-reader tests emit real EventEmitter `data`, `error` and `close` events.
+They cover stderr diagnostics, spawn and stream failures, signal termination,
+and the reporting caller: failed collection must return a nonempty error and
+must not send partial login data. Successful payloads and the Windows query
+exit-one no-user result remain covered. The full functional suite has 55 tests.
+
 These checks do not run an installed customer agent. Windows/Linux installer,
 service lifecycle, and actual user-session behavior require separate delivery
-validation. In particular, the current query fixture's stderr `error` event
-does not model real stderr text (`data`); that pre-existing behavior is not
-qualified by the query tests. Do not describe these tests as complete Windows
-error-handling proof.
+validation; synthetic process and transport tests do not establish those results.
