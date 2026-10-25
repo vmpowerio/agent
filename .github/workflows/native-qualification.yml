@@ -31,6 +31,7 @@ jobs:
           npm run build
           python3 scripts/test-stage-distribution.py
           python3 scripts/test-install-linux-bundle.py
+          python3 scripts/test-native-preparation.py
           node scripts/test-native-report-fixture.cjs
       - name: Stage pinned official runtime and labeled fixtures
         run: python3 scripts/prepare-native-inputs.py --output "$RUNNER_TEMP/vmpower-native"
@@ -78,6 +79,8 @@ jobs:
           npm run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/test-stage-distribution.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-native-preparation.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/test-native-report-fixture.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

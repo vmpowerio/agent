@@ -87,6 +87,25 @@ Staging prevention: manifest names must use POSIX separators on every host.
 Mac/Linux staging cannot qualify Windows path handling; the Windows job stages
 and verifies the real Windows bundle before any installer/service operation.
 
+Native preparation prevention: runner-owned temporary/repository ancestors are
+not a service-user access contract. The Linux harness copies only the public
+bundle and probe into the empty, root-owned `/opt/vmpower-agent-qualification`
+fixture, seals and hash-verifies it before making it readable, and includes it in
+the ownership journal and cleanup. It never changes runner ancestor permissions;
+configuration and receiver state remain separate. Probe failures emit only fixed
+classifications and exit codes, not raw stderr or environment. The first hosted
+probe failure omitted those diagnostics, so its underlying cause remains Unknown.
+An external-connect success, timeout without qualifying denial, or inaccessible
+fixture remains a failure rather than an isolation pass.
+
+Pinned vendor downloads allow at most three attempts to the same URL for429/5xx
+or transient network failures, with two/four-second backoff. Redirects, TLS
+verification failures, other HTTP errors and hash mismatches are hard stops;
+there is no mirror or unpinned fallback. The first Windows hosted attempt stopped
+on the official NSSM HTTP503 before service tests. Offline tests exercise that
+retry path and its rejection controls; only a subsequent admitted native run can
+qualify actual provider availability and lifecycle behavior.
+
 Primary behavior references: [systemd service startup semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
 [Windows program/address firewall rules](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule?view=windowsserver2025-ps),
 and [standard GitHub runner labels](https://github.com/actions/runner-images).

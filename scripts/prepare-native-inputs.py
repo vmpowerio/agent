@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Hosted only: fetch exact public vendor bytes, stage and label lifecycle fixtures."""
-import argparse,hashlib,importlib.util,json,os,platform,shutil,sys,urllib.request,zipfile
+import argparse,hashlib,importlib.util,json,os,platform,shutil,socket,sys,time,urllib.error,urllib.request,zipfile
 from pathlib import Path
 sys.dont_write_bytecode=True
 ROOT=Path(__file__).resolve().parents[1]
@@ -10,8 +10,23 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs): raise ValueError('Unexpected vendor redirect')
 def download(url,destination,digest):
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
-    with opener.open(url,timeout=60) as response:
-        raw=response.read(160*1024*1024+1)
+    for attempt in range(3):
+        try:
+            with opener.open(url,timeout=60) as response:
+                raw=response.read(160*1024*1024+1)
+            break
+        except urllib.error.HTTPError as error:
+            transient=error.code==429 or 500<=error.code<=599
+            error.close()
+            if not transient or attempt==2:raise RuntimeError('PINNED_DOWNLOAD_HTTP_'+str(error.code)) from None
+        except urllib.error.URLError as error:
+            reason=error.reason
+            transient=isinstance(reason,(TimeoutError,ConnectionError)) or (isinstance(reason,socket.gaierror) and reason.errno==socket.EAI_AGAIN)
+            if not transient:raise RuntimeError('PINNED_DOWNLOAD_TRANSPORT_REJECTED') from None
+            if attempt==2:raise RuntimeError('PINNED_DOWNLOAD_NETWORK_FAILURE') from None
+        except (TimeoutError,ConnectionError):
+            if attempt==2:raise RuntimeError('PINNED_DOWNLOAD_NETWORK_FAILURE') from None
+        time.sleep(2*(attempt+1))
     if len(raw)>160*1024*1024 or hashlib.sha256(raw).hexdigest()!=digest:raise ValueError('Pinned vendor archive mismatch')
     destination.write_bytes(raw)
 def main(out):

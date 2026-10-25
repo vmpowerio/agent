@@ -4,13 +4,40 @@ import argparse,hashlib,importlib.util,json,os,platform,pwd,grp,shlex,shutil,sig
 from pathlib import Path
 sys.dont_write_bytecode=True
 ROOT=Path(__file__).resolve().parents[1]
-MANAGED=[Path('/opt/vmpower-agent'),Path('/etc/vmpower.conf'),Path('/etc/systemd/system/vmpower.service'),Path('/usr/bin/vmpower')]
+SERVICE_FIXTURE=Path('/opt/vmpower-agent-qualification')
+MANAGED=[Path('/opt/vmpower-agent'),Path('/etc/vmpower.conf'),Path('/etc/systemd/system/vmpower.service'),Path('/usr/bin/vmpower'),SERVICE_FIXTURE]
 def guard():
     if not (sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted' and os.environ.get('ImageOS')=='ubuntu24'):
         raise RuntimeError('Root on admitted ephemeral Ubuntu24 runner required')
 def command(*args,allowed=(0,),**kwargs):
     result=subprocess.run(args,capture_output=True,text=True,timeout=35,**kwargs)
-    if result.returncode not in allowed:raise RuntimeError('Native command failed: '+str(args[0]))
+    if result.returncode not in allowed:raise RuntimeError('Native command failed: '+str(args[0])+' returncode='+str(result.returncode))
+    return result
+def service_fixture(source,expected,probe,destination):
+    """Copy public fixture bytes out of runner-private ancestors; no service action."""
+    spec=importlib.util.spec_from_file_location('fixture_installer',ROOT/'scripts/install-linux-bundle.py')
+    installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+    # Destination is empty and root owned on the guarded hosted path. Keep it
+    # private until copied bytes/modes are verified; never chmod source ancestors.
+    destination.mkdir(mode=0o700)
+    shutil.copytree(source,destination/'bundle',symlinks=True)
+    installer.seal_private_release(destination/'bundle')
+    if hashlib.sha256((destination/'bundle/bundle-manifest.json').read_bytes()).hexdigest()!=expected:
+        raise ValueError('Service fixture manifest mismatch')
+    installer.stage.verify_bundle(destination/'bundle')
+    raw=probe.read_bytes();copied=destination/'native-egress-probe.cjs'
+    copied.write_bytes(raw);copied.chmod(0o644)
+    if hashlib.sha256(copied.read_bytes()).digest()!=hashlib.sha256(raw).digest():raise ValueError('Service probe copy mismatch')
+    destination.chmod(0o755)
+    return {'manifestSha256':expected,'probeSha256':hashlib.sha256(raw).hexdigest(),'mode':'0755','sourceAncestorsChanged':False}
+def egress_probe(node,script,port):
+    result=subprocess.run(['runuser','-u','vmpower','--','env','GITHUB_ACTIONS=true','RUNNER_ENVIRONMENT=github-hosted',str(node),str(script),str(port)],capture_output=True,text=True,timeout=15)
+    if result.returncode:
+        # Only fixed classifications leave this boundary, never raw stderr/env.
+        code='UNCLASSIFIED'
+        for marker,label in [('Permission denied','EXECUTION_DENIED'),('MODULE_NOT_FOUND','MODULE_NOT_FOUND'),('Owned loopback unavailable','LOOPBACK_UNAVAILABLE'),('Direct nonloopback denial not established','EXTERNAL_DENIAL_UNPROVEN')]:
+            if marker in result.stderr:code=label;break
+        raise RuntimeError('EGRESS_PROBE_FAILED code='+code+' returncode='+str(result.returncode))
     return result
 def write(path,value):path.write_text(json.dumps(value,indent=2)+'\n')
 def wait(check,timeout=15):
@@ -42,7 +69,7 @@ def cleanup(out):
         if not process.name.isdigit():continue
         try:executable=os.readlink(process/'exe')
         except OSError:continue
-        if executable.startswith('/opt/vmpower-agent/releases/') or (executable==str(out/'bundle/runtime/node') and int(process.name)!=owned.get('receiverPid')):
+        if executable.startswith('/opt/vmpower-agent/releases/') or executable==str(SERVICE_FIXTURE/'bundle/runtime/node') or (executable==str(out/'bundle/runtime/node') and int(process.name)!=owned.get('receiverPid')):
             survivors.append(int(process.name));os.kill(int(process.name),signal.SIGKILL)
     if 'receiverPid' in owned:
         pid=owned['receiverPid']
@@ -87,27 +114,29 @@ def qualify(out):
         except KeyError:continue
         raise RuntimeError('Service account/group already exists')
     owned={'run':os.environ['GITHUB_RUN_ID'],'paths':[str(p) for p in MANAGED],'firewall':[]};write(out/'owned.json',owned)
-    prepared=json.loads((out/'evidence/prepared.json').read_text());hashes=prepared['bundles'];node=out/'bundle/runtime/node'
+    prepared=json.loads((out/'evidence/prepared.json').read_text());hashes=prepared['bundles'];node=SERVICE_FIXTURE/'bundle/runtime/node'
     phases=[];result={'status':'FAIL','head':prepared['head'],'platform':platform.platform(),'image':os.environ.get('ImageOS'),'imageVersion':os.environ.get('ImageVersion'),'architecture':platform.machine(),'libc':platform.libc_ver(),'phases':phases,'customerOSCompatibility':'Unknown'}
     try:
+        spec=importlib.util.spec_from_file_location('installer',ROOT/'scripts/install-linux-bundle.py');installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        installer.System().destination(SERVICE_FIXTURE)
+        result['serviceFixture']=service_fixture(out/'bundle',hashes['bundle'],ROOT/'scripts/native-egress-probe.cjs',SERVICE_FIXTURE)
         command('useradd','--system','--user-group','--no-create-home','--home-dir','/nonexistent','--shell','/usr/sbin/nologin','vmpower')
         uid=pwd.getpwnam('vmpower').pw_uid
         for binary,address in [('iptables','127.0.0.1/32'),('ip6tables','::1/128')]:
             args=['-m','owner','--uid-owner',str(uid),'!','-d',address,'-m','comment','--comment','VMPOWER_NATIVE_FIXTURE','-j','REJECT']
             owned['firewall'].append([binary,*args]);write(out/'owned.json',owned)
             command(binary,'-w','-I','OUTPUT','1',*args)
-        receiver=subprocess.Popen([str(node),str(ROOT/'scripts/native-report-fixture.cjs'),str(out/'receiver.json')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        receiver=subprocess.Popen([str(out/'bundle/runtime/node'),str(ROOT/'scripts/native-report-fixture.cjs'),str(out/'receiver.json')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         owned['receiverPid']=receiver.pid;write(out/'owned.json',owned)
         port=wait(lambda:state(out)['port'])
-        proof=command('runuser','-u','vmpower','--','env','GITHUB_ACTIONS=true','RUNNER_ENVIRONMENT=github-hosted',str(node),str(ROOT/'scripts/native-egress-probe.cjs'),str(port))
+        proof=egress_probe(node,SERVICE_FIXTURE/'native-egress-probe.cjs',port)
         counters=command('iptables','-w','-L','OUTPUT','-n','-v','-x').stdout.splitlines()
         assert any('VMPOWER_NATIVE_FIXTURE' in row and int(row.split()[0])>0 for row in counters)
         phases.append({'phase':'outbound-denial','status':'PASS','probe':json.loads(proof.stdout),'ipv4RulePacketsPositive':True,'ipv6RuleInstalled':True})
-        no_config=command('runuser','-u','vmpower','--',str(node),str(out/'bundle/app/index.js'),allowed=(1,))
+        no_config=command('runuser','-u','vmpower','--',str(node),str(SERVICE_FIXTURE/'bundle/app/index.js'),allowed=(1,))
         assert 'required option' in no_config.stderr
         phases.append({'phase':'real-cli-no-config','status':'PASS'})
         config={'key':'fixture "key"','secret':'fixture\\secret$(literal)','vm_id':'fixture-native','host':'localhost:'+str(port)}
-        spec=importlib.util.spec_from_file_location('installer',ROOT/'scripts/install-linux-bundle.py');installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
         command(sys.executable,str(ROOT/'scripts/install-linux-bundle.py'),'install','--apply','--bundle',str(out/'bundle'),'--expected-manifest-sha256',hashes['bundle'],'--config-stdin',input=json.dumps(config))
         config_digest=hashlib.sha256(MANAGED[1].read_bytes()).hexdigest()
         runtime=MANAGED[0]/'releases'/hashes['bundle']/'runtime/node';pid=child(runtime)
@@ -143,7 +172,7 @@ def qualify(out):
         # Synthetic legacy unit/launcher contract, using qualified Node24 bytes.
         # This does not claim compatibility with an old published Node10 binary.
         MANAGED[2].write_bytes(installer.LEGACY_UNIT)
-        MANAGED[3].write_text('#!/bin/sh\nexec '+shlex.quote(str(node))+' '+shlex.quote(str(out/'bundle/app/index.js'))+' "$@"\n')
+        MANAGED[3].write_text('#!/bin/sh\nexec '+shlex.quote(str(node))+' '+shlex.quote(str(SERVICE_FIXTURE/'bundle/app/index.js'))+' "$@"\n')
         MANAGED[3].chmod(0o755);command('systemctl','daemon-reload')
         count=state(out)['count'];command('systemctl','start','vmpower.service');wait(lambda:state(out)['count']>count);legacy_pid=child(node)
         count=state(out)['count'];migration=installer.install(out/'upgrade',hashes['upgrade'])
