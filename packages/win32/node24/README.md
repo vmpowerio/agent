@@ -63,9 +63,14 @@ not a general post-success rollback command.
 ## Held native qualification
 
 The existing Windows qualifier accepts optional `-LegacyPackages DIRECTORY
--ChocolateyVersion EXACT_VERSION`. No workflow invokes this extension yet.
-Root must first admit the exact candidate and existing Chocolatey 2.x runner
-version. No Chocolatey install/update is performed by the extension.
+-ChocolateyVersion EXACT_VERSION`. The integrated native workflow enables this
+extension with Chocolatey **2.7.4**, the version listed by the official
+[Windows 2025 image manifest](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md)
+for image `20261021.299.1` when read on 2026-10-26. Both workflow preflight and the
+extension reject version drift; neither installs nor updates Chocolatey. The
+workflow parses the candidate PowerShell before service work and stages both
+exact legacy archives through the existing no-redirect HTTPS/hash downloader.
+Root must still admit the exact source and bounded native execution.
 
 Use the existing disposable, elevated GitHub-hosted Windows 2025 fixture, empty
 VMPower destinations, owned-resource journal, loopback receiver and executable

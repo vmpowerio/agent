@@ -54,15 +54,19 @@ its hash before a real upgrade; do not delete the snapshots or old public URLs.
 ## Bounded hosted gate proposal — not dispatched
 
 Use only an explicitly admitted disposable Ubuntu 24 x64 runner with systemd and
-the existing 15-minute Linux native ceiling. No workflow/events/permissions are
-changed by this candidate. Root must admit the exact source and invocation.
+the existing 15-minute Linux native ceiling. The integrated existing workflow
+enables this extension on the explicit combined candidate branch and retains its
+events, permissions and timeout. Root must admit the exact source and invocation
+before any push; this source preparation has not dispatched CI.
 
 1. Retain the existing source tests and native input preparation. Run
    `python3 scripts/test-linux-deb.py` and the existing Linux installer tests.
    Stage the same pinned Node24 bundle/upgrade/crashing inputs with the unchanged
-   preparation helper. Copy the two exact cached debs above into
+   preparation helper. `prepare-legacy-package-inputs.py` stages the two exact
+   archived public families above from their fixed HTTPS origins into
    `$RUNNER_TEMP/vmpower-native/legacy-debs/` without installing or executing them.
-   The qualifier independently verifies both byte counts and SHA256 values.
+   It reuses the existing no-redirect downloader and verifies hashes and sizes;
+   the qualifier independently verifies both byte counts and SHA256 values.
 2. Run the existing guarded native qualifier with its optional flag:
    `sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP python3 scripts/qualify-native-linux.py --output "$RUNNER_TEMP/vmpower-native" --legacy-dpkg`.
    It retains the original nine native phases and their network/cleanup controls.
