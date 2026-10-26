@@ -22,6 +22,7 @@ hook=load('deb_hook','linux-deb-hook.py')
 fixtures=load('deb_fixtures','test-stage-distribution.py')
 dpkg_fixture=load('deb_native_fixture','qualify-linux-dpkg.py')
 native=load('deb_native','qualify-native-linux.py')
+quarantine=load('deb_quarantine','linux-package-quarantine.py')
 
 
 def ar_members(raw):
@@ -167,6 +168,54 @@ class HookTests(unittest.TestCase):
 
 
 class NativeBoundaryTests(unittest.TestCase):
+    def test_quarantine_never_blocks_runner_without_ready_watchdog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory);(out/'owned.json').write_text(json.dumps({'firewall':[]}))
+            watcher=mock.Mock(pid=321)
+            with mock.patch.object(quarantine,'guard'),mock.patch.dict(os.environ,{'GITHUB_RUN_ID':'12345'}),mock.patch.object(quarantine,'command',return_value=mock.Mock(returncode=1)) as commands,mock.patch.object(quarantine.os,'getpgrp',return_value=os.getpid()),mock.patch.object(quarantine,'identity',return_value='original'),mock.patch.object(quarantine.subprocess,'Popen',return_value=watcher),mock.patch.object(quarantine.select,'select',return_value=([],[],[])):
+                with self.assertRaisesRegex(RuntimeError,'did not become ready'):quarantine.begin(native,out,1234)
+            self.assertFalse(any('-I' in call.args for call in commands.call_args_list))
+            self.assertEqual(json.loads((out/'owned.json').read_text())['packageQuarantine']['watchdogPid'],321)
+    def test_quarantine_probe_rejects_success_and_timeout(self):
+        for outcome in [None,quarantine.socket.timeout('timed out')]:
+            connection=mock.MagicMock();connection.__enter__.return_value=connection;connection.connect.side_effect=outcome
+            with mock.patch.object(quarantine.socket,'create_connection'),mock.patch.object(quarantine.socket,'socket',return_value=connection):
+                with self.assertRaises(RuntimeError):quarantine.probe(1234)
+    def test_quarantine_rules_cover_root_and_all_nonloopback_protocols(self):
+        rules=quarantine.rules('12345')
+        self.assertEqual([r[0] for r in rules],['iptables','ip6tables'])
+        for rule in rules:
+            self.assertEqual(rule[1:4],['!','-o','lo'])
+            self.assertNotIn('--uid-owner',rule);self.assertNotIn('-p',rule)
+            self.assertIn('VMPOWER_PACKAGE_12345',rule)
+        for run in ['','abc','123;command']:
+            with self.assertRaises(ValueError):quarantine.rules(run)
+    def test_quarantine_refuses_mac_before_reading_ownership(self):
+        with mock.patch.object(quarantine.sys,'platform','darwin'):
+            with self.assertRaisesRegex(RuntimeError,'disposable'):quarantine.begin(native,Path('/not-used'),1234)
+    def test_watchdog_kills_owned_group_before_network_restore(self):
+        for current in ['original',None]:
+            events=[]
+            with mock.patch.object(quarantine,'guard'),mock.patch.object(quarantine,'identity',side_effect=['original',current]),mock.patch.object(quarantine.os,'getpgid',return_value=123),mock.patch.object(Path,'read_bytes',return_value=b'python\0/repo/scripts/qualify-native-linux.py\0--legacy-dpkg\0'),mock.patch.object(quarantine.time,'sleep'),mock.patch.object(quarantine.os,'killpg',side_effect=lambda *args:events.append(('kill',args))),mock.patch.object(quarantine,'remove_rules',side_effect=lambda run:events.append(('restore',run))):
+                quarantine.watchdog(123,'original','12345')
+            self.assertEqual(events,[('kill',(123,quarantine.signal.SIGKILL)),('restore','12345')])
+    def test_watchdog_never_kills_reused_process_group(self):
+        with mock.patch.object(quarantine,'guard'),mock.patch.object(quarantine,'identity',side_effect=['original','new-process']),mock.patch.object(quarantine.os,'getpgid',return_value=123),mock.patch.object(Path,'read_bytes',return_value=b'python\0/repo/scripts/qualify-native-linux.py\0--legacy-dpkg\0'),mock.patch.object(quarantine.time,'sleep'),mock.patch.object(quarantine.os,'killpg') as kill,mock.patch.object(quarantine,'remove_rules') as restore:
+            quarantine.watchdog(123,'original','12345')
+        kill.assert_not_called();restore.assert_called_once_with('12345')
+    def test_watchdog_rejects_workflow_shell_group_before_wait(self):
+        with mock.patch.object(quarantine,'guard'),mock.patch.object(quarantine,'identity',return_value='original'),mock.patch.object(quarantine.os,'getpgid',return_value=122),mock.patch.object(Path,'read_bytes',return_value=b'python\0/repo/scripts/qualify-native-linux.py\0--legacy-dpkg\0'),mock.patch.object(quarantine.time,'sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError,'owner mismatch'):quarantine.watchdog(123,'original','12345')
+        sleep.assert_not_called()
+    def test_quarantine_cleanup_removes_only_exact_run_rules(self):
+        calls=[]
+        def command(*args,allowed=(0,)):
+            calls.append(args)
+            return mock.Mock(returncode=1 if args[2]=='-C' and sum(c==args for c in calls)>1 else 0)
+        with mock.patch.object(quarantine,'command',side_effect=command):quarantine.remove_rules('12345')
+        self.assertEqual(len(calls),6)
+        self.assertTrue(all('VMPOWER_PACKAGE_12345' in c for c in calls))
+        self.assertTrue(all('-F' not in c and '-P' not in c for c in calls))
     def test_optional_package_gate_rejects_non_host_before_any_package_operation(self):
         with mock.patch.object(native.sys,'platform','darwin'),mock.patch.object(native,'command',side_effect=AssertionError('No host operations')):
             with self.assertRaisesRegex(RuntimeError,'admitted ephemeral'):native.qualify(Path('/not-used'),True)

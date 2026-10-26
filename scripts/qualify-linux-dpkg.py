@@ -21,6 +21,10 @@ LEGACY={
     'docs-linux.deb':{'bytes':11090764,'sha256':'e8c0028ea78322e5937becba766654f178e4dfbe1c9817af33e024d93b588311','binarySha256':'fd8bee37cb01a23aff850eb93096a6c8da7aef7ba4e62c548649399420c6849b'},
 }
 
+def quarantine():
+    spec=importlib.util.spec_from_file_location('package_quarantine',Path(__file__).with_name('linux-package-quarantine.py'))
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
 
 def verify_legacy(directory):
     if directory.is_symlink() or not directory.is_dir():raise ValueError('Real legacy-debs directory required')
@@ -82,6 +86,7 @@ def qualify(native,out,installer,hashes,result):
         native.command('dpkg','--compare-versions',version,'gt','0.1')
         receipts[name]=builder.build(out/name,hashes[name],version,packages/(name+'.deb'))
     native.command('dpkg','--compare-versions','0.0.2','gt','0.1',allowed=(1,))
+    result['quarantine']=quarantine().begin(native,out,native.state(out)['port'])
     def install(name,allowed=(0,)):
         path=packages/(name+'.deb')
         assert hashlib.sha256(path.read_bytes()).hexdigest()==receipts[name]['sha256']
