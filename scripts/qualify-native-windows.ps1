@@ -1,4 +1,5 @@
-param([Parameter(Mandatory=$true)][string]$Output,[switch]$CleanupOnly)
+param([Parameter(Mandatory=$true)][string]$Output,[switch]$CleanupOnly,
+      [string]$LegacyPackages,[string]$ChocolateyVersion)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 function Assert-Hosted {
@@ -8,6 +9,7 @@ function Assert-Hosted {
 }
 Assert-Hosted
 . (Join-Path $PSScriptRoot 'install-windows-bundle.ps1')
+. (Join-Path $PSScriptRoot 'qualify-windows-package-ownership.ps1')
 $Output=[IO.Path]::GetFullPath($Output)
 if ($Output -ine [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'vmpower-native'))) { throw 'Fixed runner fixture directory required' }
 $product=Join-Path $env:ProgramFiles 'VMPower';$configDir='C:\ProgramData\vmpower';$config=Join-Path $configDir 'vmpower.conf'
@@ -74,6 +76,12 @@ function Cleanup-Owned {
     $null=Wait-Condition { -not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'") }
     Assert-True (-not (Test-Path -LiteralPath $product) -and -not (Test-Path -LiteralPath $configDir)) 'Managed path cleanup failed'
     Assert-True (-not $owned.receiverPid -or -not (Get-Process -Id $owned.receiverPid -ErrorAction SilentlyContinue)) 'Receiver cleanup failed'
+    if ($owned.PSObject.Properties['chocolatey']) {
+        # Clean processes and firewall first, even if package cleanup then fails.
+        # Never execute the retained legacy uninstall script during cleanup.
+        $ownedTable=@{chocolatey=$owned.chocolatey;chocolateyDirectories=$owned.chocolateyDirectories;chocolateyShim=$owned.chocolateyShim}
+        & { $owned=$ownedTable;Remove-OwnedChocolateyRegistration }
+    }
     foreach ($entry in Get-ChildItem -LiteralPath $Output -Force) {
         if ($entry.Name -notin @('evidence','owned-windows.json')) { Remove-Item -LiteralPath $entry.FullName -Recurse -Force }
     }
@@ -186,6 +194,9 @@ try {
     $null=Uninstall-AgentBundle
     $null=Wait-Condition { -not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'") }
     $result.phases+=@(@{phase='synthetic-legacy-NSSM-migration';status='PASS';legacyPublishedBinary='UNRUN'})
+    if ($LegacyPackages) {
+        $result.phases+=@(Invoke-WindowsPackageOwnership $LegacyPackages $ChocolateyVersion)
+    }
     $result.status='PASS'
 } finally {
     try { $result.cleanup=Cleanup-Owned } catch { $result.status='FAIL';$result.cleanup=@{status='FAIL'};throw }
