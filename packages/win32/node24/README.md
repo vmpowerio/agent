@@ -90,7 +90,11 @@ uninstall, without script-skipping, to test:
   processes, firewall rules and fixture inputs.
 
 Versions `0.0.2` and crashing `0.0.3` in this fixture are test inputs and must never
-be published. Cleanup skips all old automation and the auto-uninstaller, including
+be published by qualification. The successful `0.0.2` archive contains the
+unmodified product `bundle`, not the synthetic comment-bearing `upgrade` bundle;
+the default lifecycle fixture still checks that separate synthetic upgrade.
+A final version and retained deliverable artifact require separate root admission.
+Cleanup skips all old automation and the auto-uninstaller, including
 when upgrade failed while `0.0.1` remains registered. Exact package directories and
 the legacy shim must be absent before ownership is recorded. A cleanup failure
 fails qualification and retains evidence; the disposable host must be discarded.
@@ -98,7 +102,17 @@ No future test may execute unsupported old telemetry without a separately review
 quarantine design. This fixture intentionally avoids that need.
 
 Local Python tests validate pack inputs using generated non-executable byte
-fixtures. They do not prove NuGet packing, PowerShell/SCM behavior, old runtime
+fixtures. The native extension additionally runs `verify-windows-package.py`
+against each actual `choco pack` archive before registration. It checks all
+payload bytes, same-ID/version metadata, no dependencies or extra payload, and
+the actual Node/NSSM ignore-marker mapping, then records each nupkg SHA-256.
+Offline archive controls use generated ZIP fixtures, not Chocolatey itself.
+Each Chocolatey transaction has a 180-second watchdog; expiry kills its process
+tree and fails qualification. A failing-child control must observe the existing
+installer's fixed recovery classification as well as restored package/service
+state, so a package lock, fetch error or timeout cannot count as rollback proof.
+The outer Windows job remains bounded at 20 minutes; no automatic retry is added.
+These checks do not prove NuGet packing, PowerShell/SCM behavior, old runtime
 compatibility, customer OS support, customer usage, signer trust or distribution
 rights. Actual old runtime and older Windows compatibility remain **unqualified**.
 Native packing, install/upgrade/rollback/uninstall and complete cleanup are release

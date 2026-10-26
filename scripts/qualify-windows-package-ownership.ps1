@@ -1,7 +1,35 @@
 # Opt-in extension of the existing isolated Windows lifecycle fixture. Never run
 # standalone: it reuses that fixture's receiver, firewall, journal and cleanup.
+function Invoke-OwnedChocolatey([string[]]$Arguments) {
+    # Package extraction, ACL work and failing-child recovery can exceed the
+    # installer's individual 30-second native-operation limit. Bound the whole
+    # package transaction separately; timeout is never rollback qualification.
+    $script:packageRecoveryObserved=$false
+    $process=New-Object Diagnostics.Process
+    $process.StartInfo.FileName=$script:chocolatey
+    $process.StartInfo.Arguments=($Arguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' '
+    $process.StartInfo.UseShellExecute=$false;$process.StartInfo.CreateNoWindow=$true
+    $process.StartInfo.RedirectStandardOutput=$true;$process.StartInfo.RedirectStandardError=$true
+    try {
+        Assert-True ($process.Start()) 'Chocolatey did not start'
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(180000)) {
+            $script:packageTimedOut=$true
+            $null=Invoke-CheckedNative 'taskkill.exe' @('/PID',[string]$process.Id,'/T','/F')
+            throw 'Chocolatey transaction timed out; native qualification failed'
+        }
+        if ($process.ExitCode -ne 0) {
+            # Distinguish the intended crashing-child rollback from download,
+            # lock, command-line or package-validation failures. Keep raw logs private.
+            $script:packageRecoveryObserved=($stdout.GetAwaiter().GetResult()+$stderr.GetAwaiter().GetResult()).Contains('Install failed; previous service restored, configuration and all releases retained')
+            throw 'Chocolatey transaction failed'
+        }
+        return $stdout.GetAwaiter().GetResult().TrimEnd([char[]]"`r`n")
+    } finally { $process.Dispose() }
+}
+
 function Get-OwnedChocolateyVersion {
-    $line=Invoke-CheckedNative $script:chocolatey @('list','--exact','vmpower-agent','--limit-output')
+    $line=Invoke-OwnedChocolatey @('list','--exact','vmpower-agent','--limit-output')
     if ([string]::IsNullOrWhiteSpace($line)) { return $null }
     if ($line -notmatch '^vmpower-agent\|(0\.0\.[123])$') { throw 'Unexpected package registration; preserve for inspection' }
     return $Matches[1]
@@ -13,7 +41,7 @@ function Remove-OwnedChocolateyRegistration {
     $version=Get-OwnedChocolateyVersion
     if ($version) {
         # Cleanup must NEVER execute the retained 0.0.1 uninstall script.
-        $null=Invoke-CheckedNative $script:chocolatey @('uninstall','vmpower-agent',('--version='+$version),
+        $null=Invoke-OwnedChocolatey @('uninstall','vmpower-agent',('--version='+$version),
             '--yes','--skip-automation-scripts','--skip-autouninstaller','--limit-output')
     }
     Assert-True (-not (Get-OwnedChocolateyVersion)) 'Owned package registration survived cleanup'
@@ -31,10 +59,11 @@ function Remove-OwnedChocolateyRegistration {
 
 function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$ExpectedChocolateyVersion) {
     Assert-Hosted
+    $script:packageTimedOut=$false
     if ($ExpectedChocolateyVersion -notmatch '^2\.[0-9]+\.[0-9]+$') { throw 'Explicit reviewed Chocolatey 2.x version required' }
     $script:chocolatey=Join-Path $env:ChocolateyInstall 'bin\choco.exe'
     Assert-NoReparsePoint $script:chocolatey
-    Assert-True ((Invoke-CheckedNative $script:chocolatey @('--version')) -ceq $ExpectedChocolateyVersion) 'Chocolatey version differs from admission'
+    Assert-True ((Invoke-OwnedChocolatey @('--version')) -ceq $ExpectedChocolateyVersion) 'Chocolatey version differs from admission'
     Assert-True (-not (Get-OwnedChocolateyVersion)) 'Package already registered; not an empty fixture'
     $directories=@('lib\vmpower-agent','lib-bad\vmpower-agent','lib-bkp\vmpower-agent') | ForEach-Object { Join-Path $env:ChocolateyInstall $_ }
     foreach ($directory in $directories) { Assert-NoReparsePoint $directory;Assert-True (-not (Test-Path -LiteralPath $directory)) 'Package directory already exists' }
@@ -44,13 +73,19 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
     $packages=Join-Path $Output 'chocolatey-ownership';$null=New-Item -ItemType Directory -Path $packages
     $runtimePins=Get-Content -Raw (Join-Path $PSScriptRoot '../distribution/runtime-pins.json') | ConvertFrom-Json
     $nodeArchive=Join-Path $Output $runtimePins.targets.'win-x64'.archive
-    foreach ($variant in @(@{name='upgrade';version='0.0.2'},@{name='crashing';version='0.0.3'})) {
+    $packedProof=@()
+    # Successful ownership uses the unmodified product bundle; only the failing
+    # successor is synthetic. Final release/version admission remains separate.
+    foreach ($variant in @(@{name='bundle';version='0.0.2'},@{name='crashing';version='0.0.3'})) {
         $inputs=Join-Path $packages $variant.name
         $buildArguments=@((Join-Path $PSScriptRoot 'build-windows-package.py'),'--bundle',(Join-Path $Output $variant.name),
             '--expected-manifest-sha256',$prepared.bundles.($variant.name),'--node-archive',$nodeArchive,
             '--nssm-archive',(Join-Path $Output 'nssm.zip'),'--version',$variant.version,'--output',$inputs)
         $null=Invoke-CheckedNative (Get-Command python).Source $buildArguments
-        $null=Invoke-CheckedNative $script:chocolatey @('pack',(Join-Path $inputs 'vmpower-agent.nuspec'),('--output-directory='+$packages),'--limit-output')
+        $null=Invoke-OwnedChocolatey @('pack',(Join-Path $inputs 'vmpower-agent.nuspec'),('--output-directory='+$packages),'--limit-output')
+        $packed=Join-Path $packages ('vmpower-agent.'+$variant.version+'.nupkg')
+        $verified=Invoke-CheckedNative (Get-Command python).Source @((Join-Path $PSScriptRoot 'verify-windows-package.py'),'--inputs',$inputs,'--package',$packed)
+        $packedProof+=@($verified | ConvertFrom-Json)
     }
     $families=@(
         @{name='docs-windows.nupkg';sha='3b34023ffa2d05b54bdf10abfe9b3c515ab5dccf70af823407dcd1cb976a8956'},
@@ -64,7 +99,7 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
         Copy-Item -LiteralPath $legacy -Destination $localPackage
         # Actual package-manager registration of exact published bytes. Do not run
         # unsupported telemetry or its destructive installer; no dependency fetch.
-        $null=Invoke-CheckedNative $script:chocolatey @('install','vmpower-agent','--version=0.0.1',('--source='+$packages),
+        $null=Invoke-OwnedChocolatey @('install','vmpower-agent','--version=0.0.1',('--source='+$packages),
             '--yes','--skip-automation-scripts','--ignore-dependencies','--limit-output')
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.1') 'Legacy ownership not registered'
         Assert-True (-not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'")) 'Skipped legacy install created a service'
@@ -81,9 +116,9 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
         }
         $configDigest=(Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash
         $count=(Receiver-State).count
-        $null=Invoke-CheckedNative $script:chocolatey @('upgrade','vmpower-agent','--version=0.0.2',('--source='+$packages),'--yes','--limit-output')
+        $null=Invoke-OwnedChocolatey @('upgrade','vmpower-agent','--version=0.0.2',('--source='+$packages),'--yes','--limit-output')
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'New package did not replace legacy registration'
-        $modern=Join-Path $product ('Agent\releases\'+$prepared.bundles.upgrade+'\runtime\node.exe')
+        $modern=Join-Path $product ('Agent\releases\'+$prepared.bundles.bundle+'\runtime\node.exe')
         $service=Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'"
         if ($disabled) {
             Assert-True ($service.State -eq 'Stopped' -and $service.StartMode -eq 'Disabled') 'Package upgrade changed stopped/disabled state'
@@ -93,13 +128,15 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Chocolatey upgrade changed configuration'
         Assert-Acl $config $false
         $failed=$false;$count=(Receiver-State).count
-        try { $null=Invoke-CheckedNative $script:chocolatey @('upgrade','vmpower-agent','--version=0.0.3',('--source='+$packages),'--yes','--limit-output') } catch { $failed=$true }
+        try { $null=Invoke-OwnedChocolatey @('upgrade','vmpower-agent','--version=0.0.3',('--source='+$packages),'--yes','--limit-output') } catch { $failed=$true }
+        Assert-True (-not $script:packageTimedOut) 'Timed-out package is not a valid rollback control'
         Assert-True $failed 'Crashing package upgrade was accepted'
+        Assert-True $script:packageRecoveryObserved 'Failure did not reach installer service recovery'
         $null=Wait-Condition { (Receiver-State).count -gt $count };$null=Service-Child $modern
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'Failed package did not restore prior registration'
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Package rollback changed configuration'
         # Run the NEW uninstaller normally, proving old destructive script is gone.
-        $null=Invoke-CheckedNative $script:chocolatey @('uninstall','vmpower-agent','--yes','--limit-output')
+        $null=Invoke-OwnedChocolatey @('uninstall','vmpower-agent','--yes','--limit-output')
         Assert-True (-not (Get-OwnedChocolateyVersion)) 'Modern package registration remains'
         $null=Wait-Condition { -not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'") }
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Modern package uninstall deleted configuration'
@@ -108,5 +145,5 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
         Remove-OwnedChocolateyRegistration
         Remove-Item -LiteralPath $localPackage
     }
-    return @{phase='real-chocolatey-ownership-synthetic-service';status='PASS';chocolateyVersion=$ExpectedChocolateyVersion;families=$proof;oldRuntimeCompatibility='UNQUALIFIED'}
+    return @{phase='real-chocolatey-ownership-synthetic-service';status='PASS';chocolateyVersion=$ExpectedChocolateyVersion;packages=$packedProof;families=$proof;oldRuntimeCompatibility='UNQUALIFIED'}
 }

@@ -15,6 +15,9 @@ spec = importlib.util.spec_from_file_location('windows_package', ROOT / 'scripts
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
 digest = package.stage.digest
+verify_spec = importlib.util.spec_from_file_location('verify_windows_package', ROOT / 'scripts/verify-windows-package.py')
+verification = importlib.util.module_from_spec(verify_spec)
+verify_spec.loader.exec_module(verification)
 
 
 class WindowsPackageInputs(unittest.TestCase):
@@ -115,6 +118,43 @@ class WindowsPackageInputs(unittest.TestCase):
         link = self.root / 'linked'; link.symlink_to(self.bundle, target_is_directory=True)
         self.bundle = link
         with self.assertRaisesRegex(ValueError, 'unlinked'): self.prepare()
+
+    def packed_fixture(self, mutate=None):
+        members = {'vmpower-agent.nuspec': (self.output / 'vmpower-agent.nuspec').read_bytes()}
+        for file in (self.output / 'tools').rglob('*'):
+            if file.is_file():
+                name = file.relative_to(self.output).as_posix()
+                if name == 'tools/node.exe.ignore': name = 'tools/bundle/runtime/node.exe.ignore'
+                members[name] = file.read_bytes()
+        members['[Content_Types].xml'] = b'<Types/>'
+        if mutate: mutate(members)
+        packed = self.root / 'fixture.nupkg'
+        with zipfile.ZipFile(packed, 'w') as archive:
+            for name, raw in members.items(): archive.writestr(name, raw)
+        return packed
+
+    def test_packed_payload_and_shim_mapping_are_bound_to_inputs(self):
+        self.prepare()
+        packed = self.packed_fixture()
+        result = verification.verify(self.output, packed)
+        self.assertEqual(result['nupkgSha256'], digest(packed.read_bytes()))
+        self.assertEqual(result['bundleManifestSha256'], self.expected)
+
+    def test_packed_tamper_missing_shim_and_extra_executable_rejected(self):
+        self.prepare()
+        mutations = [
+            lambda files: files.update({'tools/bundle/runtime/node.exe': b'tampered'}),
+            lambda files: files.pop('tools/bundle/runtime/node.exe.ignore'),
+            lambda files: files.update({'tools/extra.exe': b'unreviewed'}),
+            lambda files: files.update({'../escape': b'escape'}),
+            lambda files: files.update({'TOOLS/NSSM.EXE': b'alias'}),
+            lambda files: files.update({'tools/chocolateyBeforeModify.ps1': b'unreviewed hook'}),
+            lambda files: files.update({'vmpower-agent.nuspec': files['vmpower-agent.nuspec'].replace(b'<version>0.0.2</version>', b'<version>0.0.1</version>')}),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutations.index(mutation)):
+                with self.assertRaises(ValueError):
+                    verification.verify(self.output, self.packed_fixture(mutation))
 
 
 if __name__ == '__main__':
