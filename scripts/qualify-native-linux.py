@@ -10,6 +10,9 @@ MANAGED=[Path('/opt/vmpower-agent'),Path('/etc/vmpower.conf'),Path('/etc/systemd
 FIXED_ANCESTORS=('/', '/opt', '/etc', '/etc/systemd', '/etc/systemd/system', '/usr', '/usr/bin')
 OPT_PATH=Path('/opt')
 OPT_CHANGE={'path':'/opt','uid':0,'gid':0,'originalMode':'0777','temporaryMode':'0755'}
+def package_fixture():
+    spec=importlib.util.spec_from_file_location('linux_dpkg_fixture',ROOT/'scripts/qualify-linux-dpkg.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 def fixed_ancestor_metadata():
     """Read only an explicit public filesystem metadata allowlist; never repair it."""
     rows=[]
@@ -124,7 +127,12 @@ def cleanup(out):
     guard();out=require_output(out);journal=out/'owned.json'
     if not journal.exists():return {'status':'NO_OWNED_RESOURCES'}
     owned=json.loads(journal.read_text())
-    if owned['run']!=os.environ['GITHUB_RUN_ID'] or owned['paths']!=[str(p) for p in MANAGED]:raise RuntimeError('Cleanup ownership mismatch')
+    managed=list(MANAGED);dpkg=None
+    if 'dpkgPackage' in owned:
+        dpkg=package_fixture()
+        if owned['dpkgPackage']!=dpkg.PACKAGE:raise RuntimeError('Package cleanup ownership mismatch')
+        managed+=dpkg.EXTRA_PATHS
+    if owned['run']!=os.environ['GITHUB_RUN_ID'] or owned['paths']!=[str(p) for p in managed]:raise RuntimeError('Cleanup ownership mismatch')
     validate_opt_journal(owned)
     command('systemctl','stop','vmpower.service',allowed=(0,5))
     command('systemctl','disable','vmpower.service',allowed=(0,1))
@@ -147,7 +155,10 @@ def cleanup(out):
         binary,args=rule[0],rule[1:]
         if command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode==0:command(binary,'-w','-D','OUTPUT',*args)
         assert command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode==1
-    for path in MANAGED:
+    if dpkg:
+        if dpkg.package_state(sys.modules[__name__])!='absent':command('dpkg','--purge',dpkg.PACKAGE)
+        dpkg.require_absent(sys.modules[__name__])
+    for path in managed:
         if path.is_dir():shutil.rmtree(path)
         elif path.exists() or path.is_symlink():path.unlink()
     command('systemctl','daemon-reload');command('systemctl','reset-failed','vmpower.service',allowed=(0,1))
@@ -159,28 +170,35 @@ def cleanup(out):
         # A child owned by this process can be a zombie until waited; reap it here.
         try:os.waitpid(owned['receiverPid'],0)
         except ChildProcessError:wait(lambda:dead(owned['receiverPid']))
-    assert all(not p.exists() for p in MANAGED)
+    assert all(not p.exists() for p in managed)
     assert command('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()=='not-found'
     for path in out.iterdir():
         if path.name in ['evidence','owned.json']:continue
         if path.is_dir():shutil.rmtree(path)
         else:path.unlink()
     result={'status':'FAIL' if survivors else 'PASS','serviceAbsent':True,'childrenAbsent':not survivors,'managedFilesAbsent':True,'fixtureInputsRemoved':True,'firewallRulesRemoved':True,'receiverStopped':True}
+    if dpkg:result['packageRegistrationAbsent']=True
     write(out/'evidence/cleanup-linux.json',result)
     if survivors:raise RuntimeError('Service left children; forced cleanup performed')
     return complete_cleanup(out,owned,result)
-def qualify(out):
+def qualify(out,legacy_dpkg=False):
     guard()
     out=require_output(out)
     if (out/'owned.json').exists():raise RuntimeError('Existing ownership journal requires cleanup reconciliation')
     # Do not read any pre-existing configuration: reject the entire occupied host.
-    if any(p.exists() or p.is_symlink() for p in MANAGED):raise RuntimeError('Managed destination already exists')
+    managed=list(MANAGED);dpkg=None
+    if legacy_dpkg:
+        dpkg=package_fixture();dpkg.require_absent(sys.modules[__name__]);dpkg.verify_legacy(out/'legacy-debs')
+        managed+=dpkg.EXTRA_PATHS
+    if any(p.exists() or p.is_symlink() for p in managed):raise RuntimeError('Managed destination already exists')
     if command('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()!='not-found':raise RuntimeError('Service already exists')
     for lookup in [pwd.getpwnam,grp.getgrnam]:
         try:lookup('vmpower')
         except KeyError:continue
         raise RuntimeError('Service account/group already exists')
-    owned={'run':os.environ['GITHUB_RUN_ID'],'paths':[str(p) for p in MANAGED],'firewall':[]};write(out/'owned.json',owned)
+    owned={'run':os.environ['GITHUB_RUN_ID'],'paths':[str(p) for p in managed],'firewall':[]}
+    if dpkg:owned['dpkgPackage']=dpkg.PACKAGE
+    write(out/'owned.json',owned)
     prepared=json.loads((out/'evidence/prepared.json').read_text());hashes=prepared['bundles'];node=SERVICE_FIXTURE/'bundle/runtime/node'
     phases=[];result={'status':'FAIL','head':prepared['head'],'platform':platform.platform(),'image':os.environ.get('ImageOS'),'imageVersion':os.environ.get('ImageVersion'),'architecture':platform.machine(),'libc':platform.libc_ver(),'phases':phases,'customerOSCompatibility':'Unknown'}
     try:
@@ -250,6 +268,9 @@ def qualify(out):
         assert hashlib.sha256(MANAGED[1].read_bytes()).hexdigest()==config_digest
         installer.uninstall()
         phases.append({'phase':'synthetic-legacy-unit-migration','status':'PASS','legacyPublishedBinary':'UNRUN'})
+        if dpkg:
+            result['realPackageOwnership']={'status':'FAIL','families':[],'packages':{}}
+            dpkg.qualify(sys.modules[__name__],out,installer,hashes,result['realPackageOwnership'])
         result['status']='PASS'
     finally:
         try:result['cleanup']=cleanup(out)
@@ -257,6 +278,6 @@ def qualify(out):
         finally:write(out/'evidence/lifecycle-linux.json',result)
     print(json.dumps({'nativeLifecycle':'PASS','phases':len(phases),'cleanup':result['cleanup']['status']}))
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);parser.add_argument('--cleanup',action='store_true');args=parser.parse_args();guard()
+    parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);parser.add_argument('--cleanup',action='store_true');parser.add_argument('--legacy-dpkg',action='store_true');args=parser.parse_args();guard()
     if args.cleanup:cleanup(args.output)
-    else:qualify(args.output)
+    else:qualify(args.output,args.legacy_dpkg)

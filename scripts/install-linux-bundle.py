@@ -28,6 +28,16 @@ MARKER='# VMPower Node24 bundle installer\n'
 LEGACY_UNIT=(Path(__file__).parents[1]/'packages/debian/vmpower-agent/etc/systemd/system/vmpower.service').read_bytes()
 
 
+def launcher_bytes(expected):
+    if not re.fullmatch(r'[0-9a-f]{64}',expected): raise ValueError('Invalid release digest')
+    executable='/opt/vmpower-agent/releases/'+expected
+    return ('#!/bin/sh\n'+MARKER+'exec "'+executable+'/runtime/node" "'+executable+'/app/index.js" "$@"\n').encode()
+
+
+def unit_bytes():
+    return (MARKER+'[Unit]\nDescription=VMPower agent\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/bin/vmpower\nUser=vmpower\nRestart=on-failure\nRestartSec=10\nNoNewPrivileges=true\n\n[Install]\nWantedBy=multi-user.target\n').encode()
+
+
 def config_bytes(existing, incoming):
     raw=existing if existing is not None else incoming
     if raw is None: raise ValueError('First install requires configuration JSON on stdin')
@@ -171,10 +181,8 @@ def install(bundle,expected,incoming=None,root=Path('/'),system=None):
     if was_active: system.call('systemctl','stop','vmpower.service')
     start=old_unit is None or was_active
     try:
-        executable='/opt/vmpower-agent/releases/'+approved_digest
-        atomic_write(launcher,('#!/bin/sh\n'+MARKER+'exec "'+executable+'/runtime/node" "'+executable+'/app/index.js" "$@"\n').encode(),0o755)
-        text=MARKER+'[Unit]\nDescription=VMPower agent\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/bin/vmpower\nUser=vmpower\nRestart=on-failure\nRestartSec=10\nNoNewPrivileges=true\n\n[Install]\nWantedBy=multi-user.target\n'
-        atomic_write(unit,text.encode(),0o644)
+        atomic_write(launcher,launcher_bytes(approved_digest),0o755)
+        atomic_write(unit,unit_bytes(),0o644)
         system.call('systemctl','daemon-reload')
         if old_unit is None or was_enabled: system.call('systemctl','enable','vmpower.service')
         if start:
