@@ -63,7 +63,7 @@ function Invoke-Case([string]$Mode,[string]$ScriptPath,[bool]$Legacy=$false) {
     }
     function Set-ExecutionPolicy { param($ExecutionPolicy,$Scope,[switch]$Force); $script:case.Events.Add('execution-policy') }
     function Invoke-Expression { param($Command); $script:case.Events.Add('bootstrap-execute') }
-    Set-Alias -Name iex -Value Invoke-Expression -Scope Local
+    # The built-in read-only iex alias already resolves to this function boundary.
     function choco {
         $script:case.Events.Add('choco-'+$args[1])
         if ($Legacy) { return }
