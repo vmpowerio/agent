@@ -89,6 +89,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Stage pinned official runtime and NSSM provenance
         run: |
+          & scripts/test-windows-bootstrap.ps1
           python scripts/prepare-native-inputs.py --output "$env:RUNNER_TEMP\vmpower-native"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Real native bundle CLI and installer argv ACL controls
