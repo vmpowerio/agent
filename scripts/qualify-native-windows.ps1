@@ -48,9 +48,11 @@ function Assert-Acl([string]$Path,[bool]$PublicRead) {
     }
 }
 function Cleanup-Owned {
+    $script:cleanupPhase='ownership-journal'
     if (-not (Test-Path -LiteralPath $journal)) { return @{status='NO_OWNED_RESOURCES'} }
     $owned=Get-Content -Raw -LiteralPath $journal | ConvertFrom-Json
     Assert-True ($owned.run -eq $env:GITHUB_RUN_ID -and $owned.product -eq $product -and $owned.configDirectory -eq $configDir) 'Cleanup ownership mismatch'
+    $script:cleanupPhase='service-and-child-stop'
     $service=Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'"
     if ($service) {
         if ($service.State -ne 'Stopped') { Stop-Service -Name vmpoweragent -Force }
@@ -76,21 +78,38 @@ function Cleanup-Owned {
     $null=Wait-Condition { -not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'") }
     Assert-True (-not (Test-Path -LiteralPath $product) -and -not (Test-Path -LiteralPath $configDir)) 'Managed path cleanup failed'
     Assert-True (-not $owned.receiverPid -or -not (Get-Process -Id $owned.receiverPid -ErrorAction SilentlyContinue)) 'Receiver cleanup failed'
+    $shimCleanup=$null
     if ($owned.PSObject.Properties['chocolatey']) {
         # Clean processes and firewall first, even if package cleanup then fails.
         # Never execute the retained legacy uninstall script during cleanup.
-        $ownedTable=@{chocolatey=$owned.chocolatey;chocolateyDirectories=$owned.chocolateyDirectories;chocolateyShim=$owned.chocolateyShim}
-        & { $owned=$ownedTable;Remove-OwnedChocolateyRegistration }
+        $script:cleanupPhase='package-cleanup'
+        $ownedTable=@{chocolatey=$owned.chocolatey;chocolateyDirectories=$owned.chocolateyDirectories;chocolateyShim=$owned.chocolateyShim;chocolateyShimAbsent=($owned.PSObject.Properties['chocolateyShimAbsent'] -and $owned.chocolateyShimAbsent)}
+        $shimCleanup=& { $owned=$ownedTable;Remove-OwnedChocolateyRegistration }
     }
+    $script:cleanupPhase='fixture-input-removal'
     foreach ($entry in Get-ChildItem -LiteralPath $Output -Force) {
         if ($entry.Name -notin @('evidence','owned-windows.json')) { Remove-Item -LiteralPath $entry.FullName -Recurse -Force }
     }
     $result=@{status='PASS';serviceAbsent=$true;childrenAbsent=($survivors.Count -eq 0);managedFilesAbsent=$true;fixtureInputsRemoved=$true;firewallRulesRemoved=$true;receiverStopped=$true}
+    if ($shimCleanup) { $result.shimCleanup=$shimCleanup;$result.packageRegistrationAbsent=$true }
     Save-Json (Join-Path $Output 'evidence\cleanup-windows.json') $result
     Assert-True ($survivors.Count -eq 0) 'Service left children; forced cleanup performed'
     return $result
 }
-if ($CleanupOnly) { Cleanup-Owned | ConvertTo-Json;return }
+function Recorded-Cleanup {
+    try { return Cleanup-Owned }
+    catch {
+        $failure=@{status='FAIL';classification='OWNED_RESOURCE_CLEANUP_FAILED';phase=$script:cleanupPhase}
+        Save-Json (Join-Path $Output 'evidence\cleanup-windows.json') $failure
+        return $failure
+    }
+}
+if ($CleanupOnly) {
+    $cleanup=Recorded-Cleanup
+    $cleanup | ConvertTo-Json
+    if ($cleanup.status -eq 'FAIL') { throw 'Owned fixture cleanup failed; see sanitized cleanup receipt' }
+    return
+}
 # Reject occupied destinations before reading config or changing ACLs/services.
 Assert-True (-not (Test-Path -LiteralPath $product) -and -not (Test-Path -LiteralPath $configDir)) 'Managed destination already exists'
 Assert-True (-not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'")) 'Service already exists'
@@ -195,11 +214,25 @@ try {
     $null=Wait-Condition { -not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'") }
     $result.phases+=@(@{phase='synthetic-legacy-NSSM-migration';status='PASS';legacyPublishedBinary='UNRUN'})
     if ($LegacyPackages) {
-        $result.phases+=@(Invoke-WindowsPackageOwnership $LegacyPackages $ChocolateyVersion)
+        $result.packageOwnership=@{phase='package-entry';status='FAIL';packages=@();families=@()}
+        $result.phases+=@(Invoke-WindowsPackageOwnership $LegacyPackages $ChocolateyVersion $result.packageOwnership)
     }
     $result.status='PASS'
+} catch {
+    # Capture the primary operation before cleanup can fail or reset package state.
+    # Never persist exception messages, native stdout/stderr, config or arguments.
+    $result.status='FAIL'
+    $result.primaryFailure=@{classification='NATIVE_QUALIFICATION_FAILED';lastCompletedPhase=$(if ($result.phases.Count) {$result.phases[-1].phase} else {'none'})}
+    if ($result.ContainsKey('packageOwnership')) {
+        $result.primaryFailure.phase=$result.packageOwnership.phase
+        $result.primaryFailure.packageCommandFailure=$script:lastPackageFailure
+    }
 } finally {
-    try { $result.cleanup=Cleanup-Owned } catch { $result.status='FAIL';$result.cleanup=@{status='FAIL'};throw }
+    try {
+        $result.cleanup=Recorded-Cleanup
+        if ($result.cleanup.status -eq 'FAIL') { $result.status='FAIL' }
+    }
     finally { Save-Json (Join-Path $Output 'evidence\lifecycle-windows.json') $result }
 }
+if ($result.status -ne 'PASS') { throw 'Native qualification failed; see separate sanitized primary and cleanup receipts' }
 @{nativeLifecycle='PASS';phases=$result.phases.Count;cleanup=$result.cleanup.status} | ConvertTo-Json

@@ -88,6 +88,7 @@ jobs:
           # Official runner-images Windows2025 image 20261021.299.1, read 2026-10-26.
           $chocolateyVersion=& (Join-Path $env:ChocolateyInstall 'bin\choco.exe') --version
           if ($LASTEXITCODE -ne 0 -or ([string]$chocolateyVersion).Trim() -cne '2.7.4') { throw 'Existing Chocolatey differs from admitted 2.7.4; no installation or update allowed' }
+          & scripts/test-windows-package-cleanup.ps1
       - name: Install exact public lock and compile
         run: |
           npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org

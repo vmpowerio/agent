@@ -103,6 +103,17 @@ Cleanup skips all old automation and the auto-uninstaller, including
 when upgrade failed while `0.0.1` remains registered. Exact package directories and
 the legacy shim must be absent before ownership is recorded. A cleanup failure
 fails qualification and retains evidence; the disposable host must be discarded.
+Package operations preserve completed fixed phase markers and a primary failure
+classification independently of cleanup, so a cleanup exception cannot hide the
+operation that failed first. Raw native output and exception messages never enter
+those receipts. After actual package deregistration, cleanup reconciles only the
+exact journal-owned `bin\vmpower-agent.amd64.exe` orphan: explicit absent-before
+ownership, matching package-manager root, protected parents, no reparse point or
+directory, and a single-link regular file are required. It records the removed
+file's hash/size and asserts absence; it never glob-deletes the shared bin folder.
+Filesystem controls and the actual qualifier catch/finally regression controls
+run before native service work. Their source is preparation until admitted CI
+has executed them; a prior cleanup failure is not proof of package success.
 No future test may execute unsupported old telemetry without a separately reviewed
 quarantine design. This fixture intentionally avoids that need.
 
