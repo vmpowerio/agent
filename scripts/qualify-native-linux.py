@@ -151,13 +151,15 @@ def cleanup(out):
                 os.kill(pid,signal.SIGTERM)
             else:raise RuntimeError('RECEIVER_IDENTITY_MISMATCH')
         except (FileNotFoundError,ProcessLookupError):pass
+    # Keep whole-runner quarantine through the final actual package hook.
+    if dpkg:
+        if dpkg.package_state(sys.modules[__name__])!='absent':command('dpkg','--purge',dpkg.PACKAGE)
+        dpkg.require_absent(sys.modules[__name__])
     for rule in owned.get('firewall',[]):
         binary,args=rule[0],rule[1:]
         if command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode==0:command(binary,'-w','-D','OUTPUT',*args)
         assert command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode==1
-    if dpkg:
-        if dpkg.package_state(sys.modules[__name__])!='absent':command('dpkg','--purge',dpkg.PACKAGE)
-        dpkg.require_absent(sys.modules[__name__])
+    if dpkg:dpkg.quarantine().finish(owned)
     for path in managed:
         if path.is_dir():shutil.rmtree(path)
         elif path.exists() or path.is_symlink():path.unlink()

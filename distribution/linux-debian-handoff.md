@@ -68,7 +68,20 @@ changed by this candidate. Root must admit the exact source and invocation.
    It retains the original nine native phases and their network/cleanup controls.
    It rejects pre-existing package registration, account/config/service or owned
    package paths before reading any customer configuration.
-3. Under established service-user IPv4/IPv6 outbound denial, install each exact
+3. Keep the existing service-user IPv4/IPv6 rules. Immediately before any actual
+   package install, `linux-package-quarantine.py` adds two journaled whole-runner
+   OUTPUT rejects for every nonloopback IPv4/IPv6 protocol and identity. Root and
+   service-user socket probes must reach owned loopback and receive explicit
+   external denial; the IPv4 reject counter must cover both probes. IPv6 rule
+   readback plus an explicit denial is retained even on a host without an IPv6
+   route. No package download or dependency resolution occurs under quarantine.
+   This temporarily disconnects the GitHub runner's control connection as well.
+   A separate-session watchdog must acknowledge readiness before rules are added.
+   After 420 seconds it terminates the qualifier's private process group (including
+   dpkg/maintainer descendants) before removing only the two whole-runner rules.
+   Existing service-UID rules still deny any systemd child until ordinary cleanup.
+   Deadline expiry is a failed run, never acceptance or an automatic retry.
+   Under this quarantine, install each exact
    legacy deb with real dpkg and pre-existing synthetic config. Only its known
    postinst executes; **no legacy Node10 executable starts**. Run both collision
    controls. Build and install real `0.2.0~rc1`, `rc2`, `rc3` packages with the same
@@ -81,7 +94,8 @@ changed by this candidate. Root must admit the exact source and invocation.
 4. Always invoke the existing `--cleanup` entrypoint. Its journal now includes
    the exact fixture-owned package registration and additional fixed paths when
    this option is used; the cleanup command needs no extra flag. It purges only
-   that registration, verifies absence, removes owned state, stops all owned
+   that registration **before dropping quarantine**, verifies absence, stops the
+   exact watchdog, removes owned state, stops all owned
    processes/receivers, removes firewall rules and restores the original `/opt`
    permissions. Upload sanitized lifecycle/cleanup JSON only; no packages,
    configuration bytes, raw environments or snapshots.
@@ -91,6 +105,15 @@ Expected incremental gate work is two package-family matrices within the existin
 package compression, installation and rollback add time. This is an unmeasured
 bound proposal; timeout or incomplete cleanup is failure, not permission to
 increase resources or rerun automatically.
+
+The prior candidate incorrectly treated service-UID denial as sufficient for
+root package hooks. The package entrypoint now enforces whole-runner quarantine;
+the watchdog is necessary because a blocked runner cannot receive its next
+cleanup action. Offline tests cover the exact rule scope, process-group identity,
+deadline kill-before-restore ordering and reused-process refusal. Hosted proof of
+watchdog recovery, root/service denial, runner reconnection and package cleanup is
+still required. Do not bypass this gate based on the old postinst's current
+no-op behavior with existing synthetic configuration.
 
 ## Remaining release limits
 
