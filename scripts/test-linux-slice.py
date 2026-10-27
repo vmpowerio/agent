@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """No root/systemd/firewall/network operations: source mocks and real child tests."""
-import errno,importlib.util,json,os,signal,subprocess,sys,tempfile,time,unittest
+import errno,importlib.util,io,json,os,signal,subprocess,sys,tempfile,time,unittest
 from pathlib import Path
 from unittest import mock
 sys.dont_write_bytecode=True
@@ -77,6 +77,23 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(json.loads((evidence/'progress-linux.json').read_text())['completed'][0]['phase'],'completed')
 
 class SliceTests(unittest.TestCase):
+    def test_run_id_bounded_canonical_identity(self):
+        for run in ['1','12345','99999999999999999999']:
+            with mock.patch.dict(os.environ,{'GITHUB_RUN_ID':run}):
+                self.assertEqual(isolation.names(),{'run':run,'slice':'vmpowerfixture'+run+'.slice','qualify':'vmpowerqualify'+run+'.scope','cleanup':'vmpowercleanup'+run+'.scope'})
+        for run in ['', '0', '01', '1\n', '+1', '１', '1/2', '1;2', '1'*21, '1'*1000000]:
+            with self.subTest(run=run[:30]),mock.patch.dict(os.environ,{'GITHUB_RUN_ID':run}),mock.patch.object(Path,'read_text',side_effect=AssertionError('filesystem reached')) as reads,mock.patch.object(isolation,'require_output',side_effect=AssertionError('output reached')) as output,mock.patch.object(commands,'run',side_effect=AssertionError('command reached')) as command,mock.patch.object(isolation.socket,'create_connection',side_effect=AssertionError('socket reached')) as connect,mock.patch.object(isolation,'guard'):
+                with self.assertRaisesRegex(ValueError,'RUN_REFUSED'):isolation.names()
+                with self.assertRaisesRegex(ValueError,'RUN_REFUSED'):isolation.probe(run,1)
+                with self.assertRaisesRegex(ValueError,'RUN_REFUSED'):isolation.supervise(Path('/unused'))
+                # Execute the exact independently installed hook, not a mock copy.
+                with mock.patch.object(sys,'argv',['slice-probe.py',run,'1']),mock.patch.object(sys,'stderr',new_callable=io.StringIO) as stderr:
+                    with self.assertRaises(SystemExit) as stopped:
+                        exec(compile(isolation.probe_bytes(),'<installed-hook>','exec'),{'__name__':'__main__'})
+                    self.assertEqual(stopped.exception.code,1)
+                    self.assertEqual(stderr.getvalue(),'FIXTURE_ISOLATION_PROBE_REFUSED\n')
+                for effect in [reads,output,command,connect]:effect.assert_not_called()
+
     def setUp(self):
         self.env=mock.patch.dict(os.environ,{'GITHUB_RUN_ID':'12345'});self.env.start();self.addCleanup(self.env.stop)
     def test_wrong_cgroup_and_descendant_prefix_rejected(self):
@@ -98,6 +115,13 @@ class SliceTests(unittest.TestCase):
         with mock.patch.object(Path,'read_text',return_value='0::/vmpowerfixture12345.slice/vmpower.service'),mock.patch.object(isolation.socket,'create_connection') as positive,mock.patch.object(isolation.socket,'socket',return_value=connection) as sockets:
             result=isolation.probe('12345',1234)
         self.assertEqual(result['ipv4'],'EPERM');self.assertEqual(result['ipv6'],'EPERM');positive.assert_called_once_with(('127.0.0.1',1234),timeout=3)
+        self.assertEqual([c.args[0] for c in sockets.call_args_list],[isolation.socket.AF_INET,isolation.socket.AF_INET6])
+    def test_exact_installed_probe_includes_canonical_parser_and_runs_both_families(self):
+        connection=mock.MagicMock();connection.__enter__.return_value=connection;connection.connect.side_effect=PermissionError(errno.EPERM,'denied')
+        with mock.patch.object(Path,'read_text',return_value='0::/vmpowerfixture12345.slice/vmpower.service'),mock.patch.object(isolation.socket,'create_connection') as positive,mock.patch.object(isolation.socket,'socket',return_value=connection) as sockets,mock.patch.object(sys,'argv',['slice-probe.py','12345','1234']),mock.patch.object(sys,'stdout',new_callable=io.StringIO) as stdout:
+            exec(compile(isolation.probe_bytes(),'<installed-hook>','exec'),{'__name__':'__main__'})
+        self.assertEqual(json.loads(stdout.getvalue()),{'membership':'PASS','loopback':'PASS','ipv4':'EPERM','ipv6':'EPERM'})
+        positive.assert_called_once_with(('127.0.0.1',1234),timeout=3)
         self.assertEqual([c.args[0] for c in sockets.call_args_list],[isolation.socket.AF_INET,isolation.socket.AF_INET6])
     def test_missing_kernel_support_prevents_root_probe(self):
         with mock.patch.object(isolation,'verify',side_effect=RuntimeError('FIXTURE_ISOLATION_BPF_UNSUPPORTED')),mock.patch.object(isolation,'probe',side_effect=AssertionError('no probe')):

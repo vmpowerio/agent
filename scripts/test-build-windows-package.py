@@ -7,6 +7,7 @@ import shutil
 import struct
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -21,6 +22,15 @@ verify_spec.loader.exec_module(verification)
 
 
 class WindowsPackageInputs(unittest.TestCase):
+    def test_bounded_canonical_version_protocol(self):
+        for value in ['0.0.2','0.0.3','0.0.4','0.2.0','2147483647.2147483647.2147483647']:
+            self.assertEqual(package.package_version(value),value)
+        for value in ['',None,'0.0.1','0.0.0','01.2.3','1.02.3','1.2.03','+1.2.3',
+                      '1.2.3\n','１.2.3','1.2.3.4','2147483648.0.2','1'*1000000+'.2.3']:
+            with self.subTest(value=str(value)[:40]),mock.patch.object(Path,'exists',side_effect=AssertionError('filesystem reached')),mock.patch.object(package.stage,'verify_bundle',side_effect=AssertionError('bundle reached')):
+                with self.assertRaises(ValueError):
+                    package.prepare(Path('/unused'), 'a'*64, Path('/unused'), Path('/unused'), value, Path('/unused'))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='windows-package-control-')
         self.root = Path(self.temp.name)

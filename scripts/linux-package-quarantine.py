@@ -36,9 +36,17 @@ def guard():
     if not (sys.platform=='linux' and os.geteuid()==0 and platform.machine()=='x86_64' and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted' and os.environ.get('ImageOS')=='ubuntu24'):
         raise RuntimeError('FIXTURE_ISOLATION_HOST_REFUSED')
 
+def canonical_run_id(value):
+    # Hosted run identity: positive ASCII decimal, at most 20 digits, no aliases.
+    # Reconstruct only after bounding conversion; never silently merge 01 and 1.
+    if not isinstance(value,str) or not 1<=len(value)<=20 or any(c<'0' or c>'9' for c in value):
+        raise ValueError('FIXTURE_ISOLATION_RUN_REFUSED')
+    run=str(int(value))
+    if run=='0' or run!=value:raise ValueError('FIXTURE_ISOLATION_RUN_REFUSED')
+    return run
+
 def names():
-    run=os.environ.get('GITHUB_RUN_ID','')
-    if not re.fullmatch('[0-9]+',run):raise ValueError('FIXTURE_ISOLATION_RUN_REFUSED')
+    run=canonical_run_id(os.environ.get('GITHUB_RUN_ID',''))
     return {'run':run,'slice':'vmpowerfixture'+run+'.slice','qualify':'vmpowerqualify'+run+'.scope','cleanup':'vmpowercleanup'+run+'.scope'}
 
 def member(pid,unit=None):
@@ -72,7 +80,7 @@ def effective_filters(group):
 def probe(run,port):
     # Copied verbatim for actual service ExecStartPre and dpkg pre-invoke hooks.
     # No private checkout access, environment output or application imports.
-    if not re.fullmatch('[0-9]+',run):raise RuntimeError('FIXTURE_ISOLATION_RUN_REFUSED')
+    run=canonical_run_id(run)
     expected='/vmpowerfixture'+run+'.slice/'
     rows=Path('/proc/self/cgroup').read_text().splitlines()
     if len(rows)!=1 or not rows[0].startswith('0::'+expected):raise RuntimeError('FIXTURE_ISOLATION_MEMBERSHIP_REFUSED')
@@ -92,7 +100,7 @@ def probe(run,port):
     return {'membership':'PASS','loopback':'PASS',**outcomes}
 
 def probe_bytes():
-    return ('import errno,json,re,socket,sys\nfrom pathlib import Path\n'+inspect.getsource(probe)+
+    return ('import errno,json,socket,sys\nfrom pathlib import Path\n'+inspect.getsource(canonical_run_id)+'\n'+inspect.getsource(probe)+
             '\ntry: print(json.dumps(probe(sys.argv[1],int(sys.argv[2]))))\nexcept Exception: print("FIXTURE_ISOLATION_PROBE_REFUSED",file=sys.stderr);sys.exit(1)\n').encode()
 
 def description(data,key):return 'VMPower fixture '+data['ownershipToken']+' '+key
@@ -232,7 +240,7 @@ def require_empty(unit):
     if group.exists() and any(p.read_text().strip() for p in group.rglob('cgroup.procs')):raise RuntimeError('FIXTURE_ISOLATION_DESCENDANTS_REMAIN')
 
 def supervise(out,cleanup_only=False,legacy=False):
-    guard();out=require_output(out);n=names();record=out/'isolation.json';commands.EVIDENCE=out/'evidence'
+    guard();n=names();out=require_output(out);record=out/'isolation.json';commands.EVIDENCE=out/'evidence'
     commands.OPERATION_FILE='operation-supervisor-linux.json'
     # The runner/control supervisor must never enter the fixture slice itself.
     if any(row.startswith('0::/'+n['slice']) for row in Path('/proc/self/cgroup').read_text().splitlines()):raise RuntimeError('FIXTURE_ISOLATION_SUPERVISOR_INSIDE')

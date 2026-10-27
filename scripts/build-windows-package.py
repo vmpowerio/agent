@@ -26,13 +26,25 @@ def regular(path):
     return path.read_bytes()
 
 
+def package_version(value):
+    # Current callers use 0.0.2/3/4; allow three canonical nonnegative Int32
+    # components (the System.Version bound), at most 32 ASCII characters total.
+    if not isinstance(value,str) or not 5<=len(value)<=32:
+        raise ValueError('An explicit bounded three-part package version is required')
+    parts=value.split('.')
+    if len(parts)!=3 or any(not 1<=len(p)<=10 or any(c<'0' or c>'9' for c in p) for p in parts):
+        raise ValueError('An explicit bounded three-part package version is required')
+    numbers=tuple(int(p) for p in parts)
+    if any(n>2147483647 or str(n)!=p for p,n in zip(parts,numbers)):
+        raise ValueError('Canonical Int32 package version components required')
+    if numbers <= (0,0,1):raise ValueError('Package must upgrade published 0.0.1')
+    return '.'.join(str(n) for n in numbers)
+
+
 def prepare(bundle, expected, node_archive, nssm_archive, version, output, repo=ROOT):
     if not re.fullmatch(r'[a-f0-9]{64}', expected):
         raise ValueError('Qualified manifest SHA256 required')
-    if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
-        raise ValueError('An explicit three-part package version is required')
-    if tuple(map(int, version.split('.'))) <= (0, 0, 1):
-        raise ValueError('Package must upgrade published 0.0.1')
+    version=package_version(version)
     if output.exists() or output.is_symlink():
         raise ValueError('Output exists; retain previous package inputs')
     if bundle.is_symlink() or not bundle.is_dir():

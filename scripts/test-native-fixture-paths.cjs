@@ -9,6 +9,11 @@ const { test } = require('node:test');
 const helperDeadline = 20000;
 function runHelper(executable, args, env, timeout = helperDeadline) {
   return new Promise((resolve, reject) => {
+    // The admitted Windows fixture is C:\Windows. Refuse before creating any
+    // child; cleanup must never select an executable from an environment path.
+    if (process.platform === 'win32' && (process.env.SystemRoot !== 'C:\\Windows' || env.SystemRoot !== 'C:\\Windows')) {
+      throw new Error('WINDOWS_SYSTEM_ROOT_REFUSED');
+    }
     const child = spawn(executable, args, { env, windowsHide: true, detached: process.platform !== 'win32' });
     let stdout = '', stderr = '', timeoutError, reapFailure, closed;
     const failedReap = code => Object.assign(new AggregateError(
@@ -22,7 +27,7 @@ function runHelper(executable, args, env, timeout = helperDeadline) {
         // Reap the captured live leader's tree before awaiting its close. Never
         // use spawnSync's timeout: it kills the leader without its descendants.
         if (process.platform === 'win32') {
-          const killed = spawnSync(path.join(process.env.SystemRoot, 'System32', 'taskkill.exe'),
+          const killed = spawnSync('C:\\Windows\\System32\\taskkill.exe',
             ['/PID', String(child.pid), '/T', '/F'], { timeout: 5000, windowsHide: true, encoding: 'utf8' });
           if (killed.error || killed.status !== 0) throw new Error('OWNED_TREE_TERMINATION_FAILED');
         } else {
@@ -83,6 +88,54 @@ async function fixture(check) {
     }
   }
 }
+// Exercise this exact helper under a modeled Windows host on every platform.
+// No Windows executable is invoked; real native qualification remains separate.
+function windowsHelperModel(root = 'C:\\Windows', killStatus = 0) {
+  const { EventEmitter } = require('node:events');
+  const { PassThrough } = require('node:stream');
+  const source = fs.readFileSync(__filename, 'utf8');
+  const child = new EventEmitter();
+  child.pid = 1234; child.stdout = new PassThrough(); child.stderr = new PassThrough();
+  const calls = [], timers = [], host = { platform: 'win32', env: { SystemRoot: root } };
+  const helper = require('node:vm').runInNewContext(
+    source.slice(source.indexOf('function runHelper('), source.indexOf('async function fixture(')) + '\nrunHelper',
+    { process: host, helperDeadline, path,
+      spawn(...args) { calls.push(['spawn', ...args]); return child; },
+      spawnSync(...args) { calls.push(['kill', ...args]); return { status: killStatus }; },
+      setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {} });
+  return { helper, child, calls, timers, host };
+}
+test('Windows helper refuses missing or unadmitted roots before any child exists', async () => {
+  for (const root of [undefined, '', 'D:\\Windows', 'C:\\Windows\\evil', 'C:Windows', 'c:\\windows']) {
+    const m = windowsHelperModel(root);
+    // Explicit undefined must model a missing environment entry, not the default.
+    m.host.env.SystemRoot = root;
+    await assert.rejects(m.helper('unused', [], { SystemRoot: 'C:\\Windows' }), /WINDOWS_SYSTEM_ROOT_REFUSED/);
+    assert.equal(m.calls.length, 0); assert.equal(m.timers.length, 0);
+  }
+  for (const env of [{}, { SystemRoot: 'D:\\Windows' }]) {
+    const m = windowsHelperModel();
+    await assert.rejects(m.helper('unused', [], env), /WINDOWS_SYSTEM_ROOT_REFUSED/);
+    assert.equal(m.calls.length, 0); assert.equal(m.timers.length, 0);
+  }
+});
+test('Windows timeout fixes taskkill identity and awaits captured child close', async () => {
+  for (const killStatus of [0, 1]) {
+    const m = windowsHelperModel('C:\\Windows', killStatus);
+    let settled = false;
+    const pending = m.helper('owned-node', [], { SystemRoot: 'C:\\Windows' });
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    m.host.env.SystemRoot = 'D:\\changed-after-spawn';
+    m.timers[0]();
+    assert.equal(m.calls[1][1], 'C:\\Windows\\System32\\taskkill.exe');
+    assert.deepEqual(Array.from(m.calls[1][2]), ['/PID', '1234', '/T', '/F']);
+    assert.equal(m.calls[1][3].timeout, 5000);
+    await Promise.resolve(); assert.equal(settled, false);
+    m.child.emit('close', null, 'SIGKILL');
+    if (killStatus) await assert.rejects(pending, error => error.cleanupUnsafe === true && error.errors.length === 2);
+    else assert.equal((await pending).error.code, 'ETIMEDOUT');
+  }
+});
 function passes(result) { assert.equal(result.error, undefined); assert.equal(result.signal, null); assert.equal(result.status, 0, result.stderr); }
 function rejects(result) { assert.equal(result.error, undefined); assert.equal(result.signal, null); assert.notEqual(result.status, 0); }
 async function assertExited(pid) {
