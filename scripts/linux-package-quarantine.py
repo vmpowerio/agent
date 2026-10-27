@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Fixture slice supervision. Never change host firewall or runner networking."""
-import argparse,ctypes,errno,inspect,json,os,platform,re,socket,sys,threading
+import argparse,ctypes,errno,inspect,json,os,platform,re,socket,sys,threading,uuid
 from contextlib import contextmanager
 from pathlib import Path
 import native_linux_commands as commands
@@ -73,19 +73,23 @@ def probe_bytes():
     return ('import errno,json,re,socket,sys\nfrom pathlib import Path\n'+inspect.getsource(probe)+
             '\ntry: print(json.dumps(probe(sys.argv[1],int(sys.argv[2]))))\nexcept Exception: print("FIXTURE_ISOLATION_PROBE_REFUSED",file=sys.stderr);sys.exit(1)\n').encode()
 
-def policy(port=0):
+def description(data,key):return 'VMPower fixture '+data['ownershipToken']+' '+key
+
+def policy(port=0,token='UNADMITTED'):
     n=names()
-    return {SYSTEM/n['slice']:b'[Slice]\nIPAddressDeny=any\nIPAddressAllow=127.0.0.1/32 ::1/128\n',
+    return {SYSTEM/n['slice']:('[Unit]\nDescription=VMPower fixture '+token+' slice\n[Slice]\nIPAddressDeny=any\nIPAddressAllow=127.0.0.1/32 ::1/128\n').encode(),
             DROP/'90-vmpower-fixture.conf':('[Service]\nSlice='+n['slice']+'\nExecStartPre=/usr/bin/python3 '+str(PROBE)+' '+n['run']+' '+str(port)+'\n').encode()}
 
 def journal(out):
     data=json.loads((out/'isolation.json').read_text())
-    if data['identity']!=names() or data['state'] not in ('INTENT','READY'):raise RuntimeError('FIXTURE_ISOLATION_JOURNAL_REFUSED')
+    if (data['identity']!=names() or data['state'] not in ('INTENT','READY') or
+        data.get('unitsAbsentAtAdmission') is not True or not re.fullmatch('[0-9a-f]{32}',data.get('ownershipToken','')) or
+        set(data.get('unitStates',{}))!={'slice','qualify','cleanup'}):raise RuntimeError('FIXTURE_ISOLATION_JOURNAL_REFUSED')
     return data
 
 def verify(out):
     guard();out=require_output(out);data=journal(out)
-    for target,raw in policy(data.get('port',0)).items():
+    for target,raw in policy(data.get('port',0),data['ownershipToken']).items():
         if target.is_symlink() or target.read_bytes()!=raw:raise RuntimeError('FIXTURE_ISOLATION_POLICY_DRIFT')
     # Check the loaded policy as well as exact runtime files.
     deny=commands.run('systemctl','show',names()['slice'],'--property=IPAddressDeny','--value').stdout.strip()
@@ -98,7 +102,7 @@ def prepare_service(out,port):
     if not isinstance(port,int) or not 0<port<65536:raise ValueError('FIXTURE_ISOLATION_PORT_REFUSED')
     if data.get('port') not in (None,port):raise RuntimeError('FIXTURE_ISOLATION_PORT_DRIFT')
     data['port']=port;commands.atomic(out/'isolation.json',data)
-    target=DROP/'90-vmpower-fixture.conf';target.write_bytes(policy(port)[target]);target.chmod(0o644)
+    target=DROP/'90-vmpower-fixture.conf';target.write_bytes(policy(port,data['ownershipToken'])[target]);target.chmod(0o644)
     PROBE.write_bytes(probe_bytes());PROBE.chmod(0o644)
     commands.run('systemctl','daemon-reload');verify(out)
 
@@ -137,10 +141,43 @@ def cleanup_receiver(out):
             stopped.set();worker.join(1)
             if worker.is_alive():raise RuntimeError('FIXTURE_ISOLATION_RECEIVER_REMAINS')
 
-def stop_scope(unit):
-    if unit not in (names()['qualify'],names()['cleanup']):raise RuntimeError('FIXTURE_ISOLATION_SCOPE_REFUSED')
-    commands.run('systemctl','stop',unit,allowed=(0,5),timeout=15)
-    require_empty(unit)
+def unit_group(key):
+    n=names()
+    return Path('/sys/fs/cgroup')/n['slice'] if key=='slice' else Path('/sys/fs/cgroup')/n['slice']/n[key]
+
+def admit_units():
+    # All three units and fixed cgroup paths must be absent BEFORE intent,
+    # file creation, systemd-run or stop. Never adopt a loaded same-name unit.
+    for key in ('slice','qualify','cleanup'):
+        loaded=commands.run('systemctl','show',names()[key],'--property=LoadState','--value').stdout.strip()
+        if loaded!='not-found' or unit_group(key).exists():raise RuntimeError('FIXTURE_ISOLATION_UNIT_COLLISION')
+
+def stop_owned(out,key):
+    data=journal(out);unit=names()[key];group=unit_group(key)
+    shown=commands.run('systemctl','show',unit,'--property=LoadState','--property=Description','--property=ControlGroup').stdout
+    props=dict(line.split('=',1) for line in shown.splitlines() if '=' in line)
+    if props.get('LoadState')=='not-found':
+        if group.exists():raise RuntimeError('FIXTURE_ISOLATION_UNOWNED_CGROUP')
+        final_state='ABSENT'
+    else:
+        expected='/'+str(group.relative_to('/sys/fs/cgroup'))
+        if (data['unitStates'][key] not in ('CREATE_INTENT','OWNED','STOPPED') or
+            props.get('Description')!=description(data,key) or props.get('ControlGroup') not in ('',expected)):
+            raise RuntimeError('FIXTURE_ISOLATION_UNIT_OWNERSHIP_REFUSED')
+        # Creation is confirmed by the unique journaled description and exact
+        # cgroup, not inferred from a failed systemd-run attempt/name alone.
+        data['unitStates'][key]='OWNED';commands.atomic(out/'isolation.json',data)
+        if key=='slice' and group.exists() and any(p.read_text().strip() for p in group.rglob('cgroup.procs')):
+            raise RuntimeError('FIXTURE_ISOLATION_DESCENDANTS_REMAIN')
+        commands.run('systemctl','stop',unit,allowed=(0,5),timeout=15)
+        if group.exists() and any(p.read_text().strip() for p in group.rglob('cgroup.procs')):raise RuntimeError('FIXTURE_ISOLATION_DESCENDANTS_REMAIN')
+        final_state='STOPPED' # Do not call a still-loaded inactive unit absent.
+    data['unitStates'][key]=final_state;commands.atomic(out/'isolation.json',data)
+
+def stop_scope(unit,out):
+    keys=[key for key in ('qualify','cleanup') if names()[key]==unit]
+    if not keys:raise RuntimeError('FIXTURE_ISOLATION_SCOPE_REFUSED')
+    stop_owned(out,keys[0])
 
 def require_empty(unit):
     if unit not in (names()['qualify'],names()['cleanup'],'vmpower.service'):raise RuntimeError('FIXTURE_ISOLATION_SCOPE_REFUSED')
@@ -158,9 +195,12 @@ def supervise(out,cleanup_only=False,legacy=False):
         if saved.get('identity')!=n:raise RuntimeError('FIXTURE_ISOLATION_JOURNAL_REFUSED')
         if saved.get('state')=='REMOVED':return {'status':'ALREADY_REMOVED'}
     result={'status':'FAIL','qualifierScopeEmpty':False,'cleanupScopeEmpty':False,'isolationRemoved':False};error=None
+    outcome=out/'evidence/qualifier-outcome-linux.json'
+    if cleanup_only and outcome.exists():result['qualifierOutcome']=json.loads(outcome.read_text())
     def scope(mode):
+        data=journal(out);data['unitStates'][mode]='CREATE_INTENT';commands.atomic(record,data)
         args=['systemd-run','--scope','--quiet','--unit='+n[mode],'--slice='+n['slice'],
-              '--property=TimeoutStopSec=5s','--',sys.executable,str(ROOT/'scripts/qualify-native-linux.py'),
+              '--property=Description='+description(data,mode),'--property=TimeoutStopSec=5s','--',sys.executable,str(ROOT/'scripts/qualify-native-linux.py'),
               '--inside-slice','--output',str(out)]
         if mode=='cleanup':args.append('--cleanup')
         elif legacy:args.append('--legacy-dpkg')
@@ -169,16 +209,26 @@ def supervise(out,cleanup_only=False,legacy=False):
         if not cleanup_only:
             if record.exists() or DROP.exists() or any(p.exists() for p in policy()):raise RuntimeError('FIXTURE_ISOLATION_OCCUPIED')
             if commands.run('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()!='not-found':raise RuntimeError('FIXTURE_ISOLATION_SERVICE_OCCUPIED')
-            commands.atomic(record,{'identity':n,'state':'INTENT'})
+            admit_units()
+            data={'identity':n,'state':'INTENT','unitsAbsentAtAdmission':True,'ownershipToken':uuid.uuid4().hex,
+                  'unitStates':{'slice':'CREATE_INTENT','qualify':'NOT_CREATED','cleanup':'NOT_CREATED'}}
+            commands.atomic(record,data)
             DROP.mkdir(mode=0o755)
-            for target,raw in policy().items():target.write_bytes(raw);target.chmod(0o644)
+            for target,raw in policy(token=data['ownershipToken']).items():target.write_bytes(raw);target.chmod(0o644)
             commands.run('systemctl','daemon-reload')
-            commands.atomic(record,{'identity':n,'state':'READY'})
-            try:scope('qualify')
-            except BaseException as exc:error=exc
+            data['state']='READY';commands.atomic(record,data)
+            commands.atomic(outcome,{'status':'RUNNING'})
+            try:
+                scope('qualify');result['qualifierOutcome']={'status':'PASS'}
+            except BaseException as exc:
+                error=exc
+                failure=exc.record if isinstance(exc,commands.CommandFailure) else {'classification':'SIGNAL','signal':exc.number} if isinstance(exc,commands.Interrupted) else {'classification':'QUALIFIER_REFUSED'}
+                result['qualifierOutcome']={'status':'FAIL','failure':failure}
+            # Persist before cleanup can replace the latest operation receipt.
+            commands.atomic(outcome,result['qualifierOutcome'])
         # Previous cancellation can leave root dpkg/hooks. Stop and reap the
         # entire owned scope before any fresh cleanup hooks, never kill by name.
-        stop_scope(n['qualify']);result['qualifierScopeEmpty']=True
+        stop_scope(n['qualify'],out);result['qualifierScopeEmpty']=True
         if (out/'owned.json').exists():
             commands.atomic(out/'evidence/cleanup-linux.json',{'status':'RUNNING','resourceAbsence':'Unknown'})
             try:scope('cleanup')
@@ -190,7 +240,7 @@ def supervise(out,cleanup_only=False,legacy=False):
                     commands.atomic(receipt,{'status':'FAIL','resourceAbsence':'Unknown',
                         'failure':exc.record if isinstance(exc,commands.CommandFailure) else {'classification':'CLEANUP_SCOPE_INTERRUPTED_OR_REFUSED'}})
                 raise
-            finally:stop_scope(n['cleanup'])
+            finally:stop_scope(n['cleanup'],out)
         else:
             # Qualifier journals intent before any app/account/package mutation.
             # Unsupported BPF can therefore safely remove only its owned policy.
@@ -204,13 +254,15 @@ def supervise(out,cleanup_only=False,legacy=False):
             accepted=json.loads(lifecycle.read_text());accepted['cleanup']=cleaned
             commands.atomic(lifecycle,accepted)
         data=journal(out)
-        for target,raw in policy(data.get('port',0)).items():
+        stop_owned(out,'slice')
+        for target,raw in policy(data.get('port',0),data['ownershipToken']).items():
             if not target.exists() and data['state']=='INTENT':continue
             if target.is_symlink() or target.read_bytes()!=raw:raise RuntimeError('FIXTURE_ISOLATION_POLICY_DRIFT')
             target.unlink()
         if DROP.exists():DROP.rmdir()
-        commands.run('systemctl','daemon-reload');commands.run('systemctl','stop',n['slice'],allowed=(0,5))
-        result.update(status='PASS',isolationRemoved=True);commands.atomic(record,{'identity':n,'state':'REMOVED'})
+        commands.run('systemctl','daemon-reload')
+        data=journal(out);data['state']='REMOVED'
+        result.update(status='PASS',isolationRemoved=True);commands.atomic(record,data)
     finally:
         commands.atomic(out/'evidence/isolation-linux.json',result)
         receipt=out/'evidence/cleanup-linux.json'

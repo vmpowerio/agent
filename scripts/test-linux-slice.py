@@ -113,11 +113,11 @@ class SliceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'HOOK_GUARD'):isolation.package_args(Path('/fixture'),('dpkg','--purge','fixed'))
     def test_only_exact_owned_scope_can_be_stopped(self):
         with mock.patch.object(commands,'run',side_effect=AssertionError('no system call')):
-            with self.assertRaisesRegex(RuntimeError,'SCOPE_REFUSED'):isolation.stop_scope('runner.service')
+            with self.assertRaisesRegex(RuntimeError,'SCOPE_REFUSED'):isolation.stop_scope('runner.service',Path('/unused'))
     def test_cleanup_scope_failure_reaps_prior_scope_and_finalizes_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             out=Path(directory);(out/'evidence').mkdir();(out/'owned.json').write_text('{}')
-            (out/'isolation.json').write_text(json.dumps({'identity':isolation.names(),'state':'READY'}))
+            (out/'isolation.json').write_text(json.dumps({'identity':isolation.names(),'state':'READY','unitsAbsentAtAdmission':True,'ownershipToken':'a'*32,'unitStates':{'slice':'CREATE_INTENT','qualify':'CREATE_INTENT','cleanup':'NOT_CREATED'}}))
             original_read=Path.read_text
             def read(target,*args,**kwargs):
                 return '0::/system.slice/runner.service' if str(target)=='/proc/self/cgroup' else original_read(target,*args,**kwargs)
@@ -125,7 +125,7 @@ class SliceTests(unittest.TestCase):
             def execute(*args,**kwargs):
                 self.assertEqual(args[0],'systemd-run');events.append('cleanup-start')
                 raise commands.CommandFailure({'operation':'OWNED_SCOPE','classification':'TIMEOUT'})
-            with mock.patch.object(isolation,'guard'),mock.patch.object(isolation,'require_output',return_value=out),mock.patch.object(Path,'read_text',autospec=True,side_effect=read),mock.patch.object(isolation,'stop_scope',side_effect=lambda name:events.append(name)),mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(commands,'EVIDENCE'),mock.patch.object(commands,'OPERATION_FILE'):
+            with mock.patch.object(isolation,'guard'),mock.patch.object(isolation,'require_output',return_value=out),mock.patch.object(Path,'read_text',autospec=True,side_effect=read),mock.patch.object(isolation,'stop_scope',side_effect=lambda name,out:events.append(name)),mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(commands,'EVIDENCE'),mock.patch.object(commands,'OPERATION_FILE'):
                 with self.assertRaises(commands.CommandFailure):isolation.supervise(out,cleanup_only=True)
             self.assertEqual(events,['vmpowerqualify12345.scope','cleanup-start','vmpowercleanup12345.scope'])
             self.assertEqual(json.loads((out/'evidence/cleanup-linux.json').read_text())['status'],'FAIL')
@@ -142,6 +142,69 @@ class SliceTests(unittest.TestCase):
         with mock.patch.object(isolation,'guard'),mock.patch.object(isolation.os,'open',return_value=9),mock.patch.object(isolation.os,'close'),mock.patch.object(isolation.ctypes,'CDLL',return_value=mock.Mock(syscall=query)):
             self.assertEqual(isolation.effective_filters('/vmpowerfixture12345.slice/test.scope'),{'ingressPrograms':1,'egressPrograms':1})
         self.assertEqual([(n,op,kind,flag) for n,op,kind,flag,_ in queried],[(321,16,0,1),(321,16,1,1)])
+    def test_each_existing_unit_or_cgroup_refused_before_setup_or_stop(self):
+        for collision in ('slice','qualify','cleanup'):
+            for kind in ('loaded-unit','cgroup'):
+                with self.subTest(collision=collision,kind=kind),tempfile.TemporaryDirectory() as directory:
+                    out=Path(directory);(out/'evidence').mkdir();drop=out/'drop';calls=[]
+                    original_read=Path.read_text
+                    def read(target,*args,**kwargs):
+                        return '0::/system.slice/runner.service' if str(target)=='/proc/self/cgroup' else original_read(target,*args,**kwargs)
+                    def execute(*args,**kwargs):
+                        calls.append(args);self.assertEqual(args[:2],('systemctl','show'))
+                        loaded=kind=='loaded-unit' and args[2]==isolation.names()[collision]
+                        return mock.Mock(stdout='loaded' if loaded else 'not-found')
+                    def group(key):return mock.Mock(exists=lambda:kind=='cgroup' and key==collision)
+                    with mock.patch.object(isolation,'guard'),mock.patch.object(isolation,'require_output',return_value=out),mock.patch.object(isolation,'DROP',drop),mock.patch.object(isolation,'policy',return_value={}),mock.patch.object(isolation,'unit_group',side_effect=group),mock.patch.object(Path,'read_text',autospec=True,side_effect=read),mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(commands,'EVIDENCE'),mock.patch.object(commands,'OPERATION_FILE'),mock.patch.object(isolation,'stop_scope') as stopped:
+                        with self.assertRaisesRegex(RuntimeError,'UNIT_COLLISION'):isolation.supervise(out)
+                    self.assertFalse((out/'isolation.json').exists());self.assertFalse(drop.exists());stopped.assert_not_called()
+    def test_unowned_loaded_scope_cannot_be_stopped_after_admission(self):
+        data={'identity':isolation.names(),'ownershipToken':'a'*32,'unitStates':{'qualify':'CREATE_INTENT'}}
+        with mock.patch.object(isolation,'journal',return_value=data),mock.patch.object(commands,'run',return_value=mock.Mock(stdout='LoadState=loaded\nDescription=foreign\nControlGroup=/vmpowerfixture12345.slice/vmpowerqualify12345.scope')) as execute:
+            with self.assertRaisesRegex(RuntimeError,'OWNERSHIP_REFUSED'):isolation.stop_scope(isolation.names()['qualify'],Path('/unused'))
+        self.assertEqual(len(execute.call_args_list),1);self.assertEqual(execute.call_args.args[:2],('systemctl','show'))
+    def test_matched_created_scope_is_journaled_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory)
+            data={'identity':isolation.names(),'state':'READY','unitsAbsentAtAdmission':True,'ownershipToken':'a'*32,'unitStates':{'slice':'CREATE_INTENT','qualify':'CREATE_INTENT','cleanup':'NOT_CREATED'}}
+            (out/'isolation.json').write_text(json.dumps(data));calls=[]
+            def execute(*args,**kwargs):
+                calls.append(args)
+                if args[1]=='show':return mock.Mock(stdout='LoadState=loaded\nDescription='+isolation.description(data,'qualify')+'\nControlGroup=/vmpowerfixture12345.slice/vmpowerqualify12345.scope')
+                self.assertEqual(json.loads((out/'isolation.json').read_text())['unitStates']['qualify'],'OWNED')
+                return mock.Mock(stdout='')
+            with mock.patch.object(commands,'run',side_effect=execute):isolation.stop_scope(isolation.names()['qualify'],out)
+            self.assertEqual([args[1] for args in calls],['show','stop'])
+            self.assertEqual(json.loads((out/'isolation.json').read_text())['unitStates']['qualify'],'STOPPED')
+    def test_unadmitted_journal_cannot_authorize_a_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory);(out/'isolation.json').write_text(json.dumps({'identity':isolation.names(),'state':'READY'}))
+            with mock.patch.object(commands,'run',side_effect=AssertionError('no command')):
+                with self.assertRaisesRegex(RuntimeError,'JOURNAL_REFUSED'):isolation.stop_scope(isolation.names()['qualify'],out)
+    def test_qualifier_timeout_or_signal_survives_successful_cleanup(self):
+        failures=[commands.CommandFailure({'operation':'OWNED_SCOPE','classification':'TIMEOUT','diagnosticLabels':['UNCLASSIFIED']}),commands.Interrupted(signal.SIGTERM)]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__),tempfile.TemporaryDirectory() as directory:
+                out=Path(directory);(out/'evidence').mkdir();system=out/'system';system.mkdir()
+                original_read=Path.read_text
+                def read(target,*args,**kwargs):
+                    return '0::/system.slice/runner.service' if str(target)=='/proc/self/cgroup' else original_read(target,*args,**kwargs)
+                def execute(*args,**kwargs):
+                    if args[0]=='systemd-run':
+                        if '--cleanup' not in args:
+                            (out/'owned.json').write_text('{}');raise failure
+                        self.assertEqual(json.loads((out/'evidence/qualifier-outcome-linux.json').read_text())['status'],'FAIL')
+                        commands.atomic(out/'evidence/operation-supervisor-linux.json',{'classification':'SUCCESS'})
+                        commands.atomic(out/'evidence/cleanup-linux.json',{'status':'PASS'})
+                    return mock.Mock(stdout='not-found')
+                with mock.patch.object(isolation,'guard'),mock.patch.object(isolation,'require_output',return_value=out),mock.patch.object(isolation,'SYSTEM',system),mock.patch.object(isolation,'DROP',system/'vmpower.service.d'),mock.patch.object(isolation,'admit_units'),mock.patch.object(Path,'read_text',autospec=True,side_effect=read),mock.patch.object(isolation,'stop_scope'),mock.patch.object(isolation,'stop_owned'),mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(commands,'EVIDENCE'),mock.patch.object(commands,'OPERATION_FILE'):
+                    with self.assertRaises(type(failure)):isolation.supervise(out)
+                saved=json.loads((out/'evidence/qualifier-outcome-linux.json').read_text())
+                self.assertEqual(saved['status'],'FAIL')
+                self.assertEqual(saved['failure']['classification'],'TIMEOUT' if isinstance(failure,commands.CommandFailure) else 'SIGNAL')
+                final=json.loads((out/'evidence/isolation-linux.json').read_text())
+                self.assertEqual(final['status'],'PASS');self.assertEqual(final['qualifierOutcome'],saved)
+                self.assertEqual(json.loads((out/'evidence/cleanup-linux.json').read_text())['status'],'PASS')
     def test_purge_failure_always_writes_closed_cleanup_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             out=Path(directory);(out/'evidence').mkdir();(out/'owned.json').write_text(json.dumps({'run':'12345','paths':[str(p) for p in native.MANAGED]}))
