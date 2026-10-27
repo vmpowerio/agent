@@ -7,6 +7,7 @@ const { spawnSync } = require('node:child_process');
 const { test } = require('node:test');
 function fixture(check) {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'native-path-control-')));
+  let primaryFailure;
   try {
     const root = path.join(temp, 'vmpower-native');
     const bundle = path.join(root, 'bundle');
@@ -32,10 +33,58 @@ function fixture(check) {
       env: { ...process.env, NODE_OPTIONS: '', GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted' }
     });
     check({ temp, root, bundle, node, run, preload });
-  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    try {
+      // Allow brief Windows sharing delays after synchronous children exit.
+      // Node handles readonly files; persistent denial must still fail the test.
+      fs.rmSync(temp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (cleanupFailure) {
+      if (primaryFailure) throw new AggregateError([primaryFailure, cleanupFailure], 'Fixture and cleanup both failed');
+      throw cleanupFailure;
+    }
+  }
 }
 function passes(result) { assert.equal(result.error, undefined); assert.equal(result.signal, null); assert.equal(result.status, 0, result.stderr); }
 function rejects(result) { assert.equal(result.error, undefined); assert.equal(result.signal, null); assert.notEqual(result.status, 0); }
+test('fixture cleans readonly files after a primary failure and preserves that failure', () => {
+  const primary = new Error('FIXTURE_PRIMARY_FAILURE');
+  let owned;
+  assert.throws(() => fixture(({ temp }) => {
+    owned = temp;
+    const file = path.join(temp, 'readonly');
+    fs.writeFileSync(file, 'fixture'); fs.chmodSync(file, 0o400);
+    throw primary;
+  }), error => error === primary);
+  assert.equal(fs.existsSync(owned), false);
+});
+for (const primaryFails of [false, true]) {
+  test(`fixture preserves persistent cleanup failure with primary failure ${primaryFails}`, context => {
+    const primary = new Error('FIXTURE_PRIMARY_FAILURE');
+    const denied = Object.assign(new Error('FIXTURE_CLEANUP_DENIED'), { code: 'EPERM' });
+    const remove = fs.rmSync;
+    let owned;
+    const removal = context.mock.method(fs, 'rmSync', (target, options) => {
+      if (target !== owned) return remove(target, options);
+      // Model native removal exhausting its bounded retry, not a successful delete.
+      throw denied;
+    });
+    try {
+      assert.throws(() => fixture(({ temp }) => {
+        owned = temp;
+        if (primaryFails) throw primary;
+      }), error => primaryFails
+        ? error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === denied
+        : error === denied);
+      assert.equal(fs.existsSync(owned), true);
+    } finally {
+      removal.mock.restore();
+      if (owned) remove(owned, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
+  });
+}
 test('real smoke helper uses the executable bundle without a path argument', () => fixture(({ run }) => {
   passes(run('native-bundle-smoke.cjs'));
 }));
