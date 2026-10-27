@@ -6,7 +6,8 @@ orphan legacy shim; it did not prove product-side shim cleanup. The following
 product-hook correction is source-only until a new admitted native run passes.
 
 The product hooks now preflight the exact `bin\vmpower-agent.amd64.exe` path and
-remove it only after successful activation/removal. Existing shims must match
+remove it inside the recoverable activation transaction, or before service removal
+on uninstall. Existing shims must match
 one of the two exact SHA-256/size pairs observed from the pinned legacy packages
 in that run, under `C:\ProgramData\chocolatey`, with protected ownership/ACLs,
 no reparse points and a single link. Unknown bytes, custom roots, unsafe parents
@@ -30,6 +31,18 @@ refusal controls. Those local wiring controls do not replace actual shim proof.
 Post-success rollback to legacy is still unqualified: in-memory installer failure
 recovery is not a persistent operator rollback command, and normal old-package
 downgrade would overwrite configuration.
+
+The first product correction (`0416667`) incorrectly removed the shim after the
+service transaction returned. A changed/locked/denied shim could then fail the
+package operation while leaving the service on the new runtime. The successor
+places both Chocolatey ignore-marker restoration and shim removal inside the
+installer's activation catch boundary. Compensation restores wrapper, application,
+arguments, directory, NSSM startup mode and prior running/stopped state; failures
+remain failures. Uninstall reconciles the shim before touching the service.
+Controls exercise changed, locked, denied and marker failures through the actual
+installer with modeled SCM; a synthetic native package additionally requires
+real Chocolatey registration and actual service/child/config restoration while
+preserving the unrelated replacement. This is source preparation, not native proof.
 
 Use the existing `vmpower-agent` package ID with an explicit version greater than
 `0.0.1`. A normal Chocolatey upgrade invokes the **new** install script after the
@@ -125,11 +138,14 @@ uninstall, without script-skipping, to test:
 - removal of owned package registration, exact caches, legacy shim, service,
   processes, firewall rules and fixture inputs.
 
-Versions `0.0.2` and crashing `0.0.3` in this fixture are test inputs and must never
+Versions `0.0.2`, crashing `0.0.3`, and finalization-failure `0.0.4` in this fixture are test inputs and must never
 be published by qualification. The successful `0.0.2` archive contains the
 unmodified product `bundle`, not the synthetic comment-bearing `upgrade` bundle;
 the default lifecycle fixture still checks that separate synthetic upgrade.
 A final version and retained deliverable artifact require separate root admission.
+The `0.0.4` fixture uses the explicitly synthetic upgrade bundle and a labeled
+test finalizer. It must fail after activation, preserve the replacement sentinel,
+and restore `0.0.2` package/service state before ordinary uninstall is tested.
 Cleanup skips all old automation and the auto-uninstaller, including
 when upgrade failed while `0.0.1` remains registered. Exact package directories and
 the legacy shim must be absent before ownership is recorded. A cleanup failure

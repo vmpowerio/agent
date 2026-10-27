@@ -36,7 +36,7 @@ function Invoke-OwnedChocolatey([string[]]$Arguments) {
 function Get-OwnedChocolateyVersion {
     $line=Invoke-OwnedChocolatey @('list','--exact','vmpower-agent','--limit-output')
     if ([string]::IsNullOrWhiteSpace($line)) { return $null }
-    if ($line -notmatch '^vmpower-agent\|(0\.0\.[123])$') { throw 'Unexpected package registration; preserve for inspection' }
+    if ($line -notmatch '^vmpower-agent\|(0\.0\.[1234])$') { throw 'Unexpected package registration; preserve for inspection' }
     return $Matches[1]
 }
 
@@ -127,13 +127,33 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
     $packedProof=@()
     # Successful ownership uses the unmodified product bundle; only the failing
     # successor is synthetic. Final release/version admission remains separate.
-    foreach ($variant in @(@{name='bundle';version='0.0.2'},@{name='crashing';version='0.0.3'})) {
+    foreach ($variant in @(@{name='bundle';source='bundle';version='0.0.2'},@{name='crashing';source='crashing';version='0.0.3'},
+        @{name='shim-failure';source='upgrade';version='0.0.4'})) {
         $Evidence.phase='build-'+$variant.name
         $inputs=Join-Path $packages $variant.name
-        $buildArguments=@((Join-Path $PSScriptRoot 'build-windows-package.py'),'--bundle',(Join-Path $Output $variant.name),
-            '--expected-manifest-sha256',$prepared.bundles.($variant.name),'--node-archive',$nodeArchive,
+        $buildArguments=@((Join-Path $PSScriptRoot 'build-windows-package.py'),'--bundle',(Join-Path $Output $variant.source),
+            '--expected-manifest-sha256',$prepared.bundles.($variant.source),'--node-archive',$nodeArchive,
             '--nssm-archive',(Join-Path $Output 'nssm.zip'),'--version',$variant.version,'--output',$inputs)
         $null=Invoke-CheckedNative (Get-Command python).Source $buildArguments
+        if ($variant.name -eq 'shim-failure') {
+            # Explicit synthetic package only: replace an absent shim after the
+            # real installer activates a different content-addressed runtime.
+            # Invoke the actual proof/removal code, which must refuse it and
+            # trigger the existing SCM transaction plus Chocolatey rollback.
+            $helperPath=Join-Path $inputs 'tools\package-shim.ps1'
+            $helper=[IO.File]::ReadAllText($helperPath).Replace('function Remove-VmpowerPackageShim(', 'function Remove-VerifiedVmpowerPackageShim(')
+            $helper+=@'
+
+# SYNTHETIC FINALIZATION FAILURE FIXTURE; NEVER PUBLISH.
+function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
+    $sentinel=Join-Path $env:ChocolateyInstall 'bin\vmpower-agent.amd64.exe'
+    if (Test-Path -LiteralPath $sentinel) { throw 'Unexpected shim before synthetic replacement' }
+    [IO.File]::WriteAllText($sentinel,'synthetic unrelated replacement after activation')
+    Remove-VerifiedVmpowerPackageShim $ToolsDirectory $Before
+}
+'@
+            [IO.File]::WriteAllText($helperPath,$helper)
+        }
         $Evidence.phase='pack-'+$variant.name
         $null=Invoke-OwnedChocolatey @('pack',(Join-Path $inputs 'vmpower-agent.nuspec'),('--output-directory='+$packages),'--limit-output')
         $packed=Join-Path $packages ('vmpower-agent.'+$variant.version+'.nupkg')
@@ -201,7 +221,25 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'Failed package did not restore prior registration'
         Assert-True (-not (Test-Path -LiteralPath $shim)) 'Failed modern successor recreated a legacy shim'
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Package rollback changed configuration'
-        $familyEvidence.phases+=@('package-and-service-rollback');$Evidence.phase='modern-package-uninstall'
+        $familyEvidence.phases+=@('package-and-service-rollback')
+        $Evidence.phase='post-activation-shim-failure-rollback'
+        $priorService=Get-ServiceSnapshot 'vmpoweragent' $wrapper
+        $count=(Receiver-State).count;$failed=$false
+        try { $null=Invoke-OwnedChocolatey @('upgrade','vmpower-agent','--version=0.0.4',('--source='+$packages),'--yes','--limit-output') } catch { $failed=$true }
+        Assert-True ($failed -and -not $script:packageTimedOut -and $script:packageRecoveryObserved) 'Finalization failure did not invoke service compensation'
+        Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'Finalization failure did not restore prior package registration'
+        $restoredService=Get-ServiceSnapshot 'vmpoweragent' $wrapper
+        foreach ($setting in @('ImagePath','Application','AppDirectory','AppParameters','Active','Start')) {
+            Assert-True ($restoredService[$setting] -ceq $priorService[$setting]) ('Finalization did not restore service '+$setting)
+        }
+        $null=Wait-Condition { (Receiver-State).count -gt $count };$null=Service-Child $modern
+        Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Finalization rollback changed configuration'
+        Assert-True ((Test-Path -LiteralPath $shim) -and [IO.File]::ReadAllText($shim) -ceq 'synthetic unrelated replacement after activation') 'Finalization rollback changed unrelated shim'
+        $familyEvidence.phases+=@('post-activation-shim-failure-restores-package-service')
+        # Remove only the exact sentinel this adverse control created, after its
+        # preservation and service/package compensation assertions succeeded.
+        Remove-Item -LiteralPath $shim
+        $Evidence.phase='modern-package-uninstall'
         # Run the NEW uninstaller normally, proving old destructive script is gone.
         $null=Invoke-OwnedChocolatey @('uninstall','vmpower-agent','--yes','--limit-output')
         Assert-True (-not (Get-OwnedChocolateyVersion)) 'Modern package registration remains'

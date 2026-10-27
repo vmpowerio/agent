@@ -4,6 +4,7 @@ param(
     [string]$ExpectedManifestSha256,
     [string]$NssmExe,
     [switch]$ConfigStdin,
+    [scriptblock]$AfterActivation,
     [switch]$Apply
 )
 Set-StrictMode -Version Latest
@@ -156,6 +157,7 @@ function Get-ServiceSnapshot([string]$Name, [string]$Nssm) {
     if ($service.StartName -ne 'LocalSystem') { throw 'Existing service uses a custom identity; preserve it for explicit migration qualification' }
     if ($service.PathName -notmatch '(?i)(^|[\\"])nssm\.exe"?$') { throw 'Existing service is not the NSSM contract' }
     return @{ ImagePath=$service.PathName; Active=($service.State -eq 'Running');
+        Start=(Invoke-CheckedNative $Nssm @('get',$Name,'Start'));
         Application=(Invoke-CheckedNative $Nssm @('get',$Name,'Application'));
         AppDirectory=(Invoke-CheckedNative $Nssm @('get',$Name,'AppDirectory'));
         AppParameters=(Invoke-CheckedNative $Nssm @('get',$Name,'AppParameters')) }
@@ -186,7 +188,8 @@ function Wait-StableServiceChild([string]$Name,[string]$Executable) {
     throw 'Stable service child was not observed'
 }
 
-function Install-AgentBundle([string]$Source, [string]$Expected, [string]$Wrapper, [string]$IncomingJson) {
+function Install-AgentBundle([string]$Source, [string]$Expected, [string]$Wrapper, [string]$IncomingJson,
+    [scriptblock]$AfterActivation = $null) {
     $pins = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '../distribution/nssm-pins.json') | ConvertFrom-Json
     Assert-NoReparsePoint $Wrapper
     if ((Get-FileHash -LiteralPath $Wrapper -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pins.x64Sha256) { throw 'Unqualified NSSM executable' }
@@ -250,13 +253,16 @@ function Install-AgentBundle([string]$Source, [string]$Expected, [string]$Wrappe
             if ((Get-Service -Name $serviceName).Status -ne 'Running') { throw 'Service failed to start' }
             Wait-StableServiceChild $serviceName $node
         }
+        # Package finalization is part of activation: its failure must restore
+        # SCM/runtime before Chocolatey rolls back its own package files.
+        if ($AfterActivation) { & $AfterActivation }
     } catch {
         try {
             $current=Get-Service -Name $serviceName -ErrorAction SilentlyContinue
             if ($current -and $current.Status -ne 'Stopped') { $null=Invoke-CheckedNative $installedWrapper @('stop',$serviceName) }
             if ($created) { $null=Invoke-CheckedNative $installedWrapper @('remove',$serviceName,'confirm') }
             elseif ($previous) {
-                foreach ($setting in @('Application','AppDirectory','AppParameters')) { $null=Invoke-CheckedNative $installedWrapper @('set',$serviceName,$setting,$previous[$setting]) }
+                foreach ($setting in @('Application','AppDirectory','AppParameters','Start')) { $null=Invoke-CheckedNative $installedWrapper @('set',$serviceName,$setting,$previous[$setting]) }
                 $null=Invoke-CheckedNative 'sc.exe' @('config',$serviceName,'binPath=',$previous.ImagePath)
                 if ($previous.Active) { Start-Service -Name $serviceName }
             }
@@ -287,6 +293,6 @@ if ($MyInvocation.InvocationName -ne '.') {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator required' }
     if ($Action -eq 'Install') {
         $json=if ($ConfigStdin) { [Console]::In.ReadToEnd() } else { $null }
-        Install-AgentBundle $Bundle $ExpectedManifestSha256 $NssmExe $json | ConvertTo-Json
+        Install-AgentBundle $Bundle $ExpectedManifestSha256 $NssmExe $json $AfterActivation | ConvertTo-Json
     } else { Uninstall-AgentBundle | ConvertTo-Json }
 }
