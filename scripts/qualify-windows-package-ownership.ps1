@@ -137,6 +137,29 @@ function Remove-OwnedChocolateyRegistration {
     return Remove-OwnedLegacyShim $owned $true
 }
 
+function Get-FixtureShimFingerprint([string]$Path) {
+    Assert-NoReparsePoint $Path;Assert-SingleLinkFile $Path
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $info=New-Object VMPower.FileLinks+Info
+        Assert-True ([VMPower.FileLinks]::GetFileInformationByHandle($stream.SafeFileHandle,[ref]$info)) 'Shim identity unavailable'
+        return @{sha256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant();bytes=$stream.Length;
+            acl=(Get-Acl -LiteralPath $Path).Sddl;fileIdentity=('{0:x8}:{1:x8}:{2:x8}' -f $info.Volume,$info.IndexHigh,$info.IndexLow)}
+    } finally { $stream.Dispose() }
+}
+
+function Assert-FixtureShimOutcome([string]$Path,[hashtable]$Before) {
+    if ($Before.status -eq 'QUALIFIED_LEGACY') {
+        Assert-True (-not (Test-Path -LiteralPath $Path)) 'Qualified legacy shim still requires fixture rescue'
+    } else {
+        Assert-True ($Before.status -eq 'UNQUALIFIED_PRESERVED') 'Unexpected preservation classification'
+        $after=Get-FixtureShimFingerprint $Path
+        foreach ($field in @('sha256','bytes','acl','fileIdentity')) {
+            Assert-True ($after[$field] -ceq $Before[$field]) ('Unqualified shim changed: '+$field)
+        }
+    }
+}
+
 function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$ExpectedChocolateyVersion,[hashtable]$Evidence) {
     Assert-Hosted
     $Evidence.phase='package-preflight';$Evidence.status='FAIL';$Evidence.packages=@();$Evidence.families=@()
@@ -151,18 +174,19 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
     $shim=Join-Path $env:ChocolateyInstall 'bin\vmpower-agent.amd64.exe'
     Assert-NoReparsePoint $shim;Assert-True (-not (Test-Path -LiteralPath $shim)) 'Legacy shim already exists'
     $owned.chocolatey=$script:chocolatey;$owned.chocolateyDirectories=@($directories);$owned.chocolateyShim=$shim;$owned.chocolateyShimAbsent=$true;Save-Json $journal $owned
-    # Actual product proof must reject an unrelated regular file, even at the
-    # right protected path and exact expected size. Never execute this sentinel.
+    # Actual product code must preserve, not adopt, safe unrelated same-size
+    # bytes. Never execute this sentinel or infer its ownership from its path.
     . (Join-Path $PSScriptRoot '../packages/win32/node24/tools/package-shim.ps1')
-    $Evidence.phase='product-shim-ownership-refusal'
+    $Evidence.phase='product-unqualified-shim-preservation'
     [IO.File]::WriteAllBytes($shim,(New-Object byte[] 121856))
-    $sentinelHash=(Get-FileHash -LiteralPath $shim -Algorithm SHA256).Hash
-    $rejected=$false
-    try { $null=Get-VmpowerPackageShimState (Join-Path $env:ChocolateyInstall 'lib\vmpower-agent\tools') } catch { $rejected=$true }
-    Assert-True ($rejected -and (Test-Path -LiteralPath $shim) -and
-        (Get-FileHash -LiteralPath $shim -Algorithm SHA256).Hash -ceq $sentinelHash) 'Product proof accepted or changed an unrelated shim'
+    $packageTools=Join-Path $env:ChocolateyInstall 'lib\vmpower-agent\tools'
+    $sentinelBefore=Get-FixtureShimFingerprint $shim;$sentinelBefore.status='UNQUALIFIED_PRESERVED'
+    $sentinelState=Get-VmpowerPackageShimState $packageTools
+    Assert-True ($sentinelState.status -ceq 'UNQUALIFIED_PRESERVED') 'Product adopted unrelated bytes'
+    Remove-VmpowerPackageShim $packageTools $sentinelState
+    Assert-FixtureShimOutcome $shim $sentinelBefore
     Remove-Item -LiteralPath $shim
-    $Evidence.unrelatedShimRefusal='PASS'
+    $Evidence.unrelatedShimPreservation='PASS'
     $packages=Join-Path $Output 'chocolatey-ownership';$null=New-Item -ItemType Directory -Path $packages
     $runtimePins=Get-Content -Raw (Join-Path $PSScriptRoot '../distribution/runtime-pins.json') | ConvertFrom-Json
     $nodeArchive=Join-Path $Output $runtimePins.targets.'win-x64'.archive
@@ -178,10 +202,9 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
             '--nssm-archive',(Join-Path $Output 'nssm.zip'),'--version',$variant.version,'--output',$inputs)
         $null=Invoke-CheckedNative (Get-Command python).Source $buildArguments
         if ($variant.name -eq 'shim-failure') {
-            # Explicit synthetic package only: replace an absent shim after the
-            # real installer activates a different content-addressed runtime.
-            # Invoke the actual proof/removal code, which must refuse it and
-            # trigger the existing SCM transaction plus Chocolatey rollback.
+            # Synthetic finalizer only: deny reading a preserved shim, or create
+            # a replacement if the qualified predecessor was removed. The real
+            # product check must fail inside SCM and Chocolatey rollback.
             $helperPath=Join-Path $inputs 'tools\package-shim.ps1'
             $helper=[IO.File]::ReadAllText($helperPath).Replace('function Remove-VmpowerPackageShim(', 'function Remove-VerifiedVmpowerPackageShim(')
             $helper+=@'
@@ -189,6 +212,11 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
 # SYNTHETIC FINALIZATION FAILURE FIXTURE; NEVER PUBLISH.
 function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
     $sentinel=Join-Path $env:ChocolateyInstall 'bin\vmpower-agent.amd64.exe'
+    if ($Before.status -eq 'UNQUALIFIED_PRESERVED') {
+        $lock=[IO.File]::Open($sentinel,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { Remove-VerifiedVmpowerPackageShim $ToolsDirectory $Before } finally { $lock.Dispose() }
+        return
+    }
     if (Test-Path -LiteralPath $sentinel) { throw 'Unexpected shim before synthetic replacement' }
     [IO.File]::WriteAllText($sentinel,'synthetic unrelated replacement after activation')
     Remove-VerifiedVmpowerPackageShim $ToolsDirectory $Before
@@ -205,11 +233,12 @@ function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
         $Evidence.packages=@($packedProof)
     }
     $families=@(
-        @{name='docs-windows.nupkg';sha='3b34023ffa2d05b54bdf10abfe9b3c515ab5dccf70af823407dcd1cb976a8956'},
-        @{name='dashboard-windows.nupkg';sha='1e72a1db993a3b013b8503e8cde2f0492a8bcee18539ee9e1056c2eb203893af'})
+        @{name='docs-windows.nupkg';sha='3b34023ffa2d05b54bdf10abfe9b3c515ab5dccf70af823407dcd1cb976a8956';shimCase='generated'},
+        @{name='dashboard-windows.nupkg';sha='1e72a1db993a3b013b8503e8cde2f0492a8bcee18539ee9e1056c2eb203893af';shimCase='generated'},
+        @{name='docs-windows.nupkg';sha='3b34023ffa2d05b54bdf10abfe9b3c515ab5dccf70af823407dcd1cb976a8956';shimCase='unrelated-sentinel'})
     $proof=@()
     foreach ($family in $families) {
-        $familyEvidence=@{family=$family.name;packageSha256=$family.sha;phases=@()};$Evidence.families+=@($familyEvidence)
+        $familyEvidence=@{family=$family.name;packageSha256=$family.sha;shimCase=$family.shimCase;phases=@()};$Evidence.families+=@($familyEvidence)
         $Evidence.phase='legacy-registration';$Evidence.family=$family.name
         Assert-True (-not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'")) 'Service must be absent between package cases'
         $legacy=Join-Path $LegacyPackages $family.name;Assert-NoReparsePoint $legacy
@@ -223,6 +252,23 @@ function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.1') 'Legacy ownership not registered'
         Assert-True (-not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'")) 'Skipped legacy install created a service'
         Assert-True (Test-Path -LiteralPath $shim -PathType Leaf) 'Legacy automatic shim missing; migration control not exercised'
+        if ($family.shimCase -eq 'unrelated-sentinel') {
+            # Adverse input setup in the third disposable case, after both real
+            # generated-shim cases completed all preservation/removal assertions.
+            # This path was journaled absent before the fixture created it.
+            $generated=Get-FixtureShimFingerprint $shim
+            $generatedState=Get-VmpowerPackageShimState $packageTools
+            $generated.status=$generatedState.status
+            Remove-VmpowerPackageShim $packageTools $generatedState
+            Assert-FixtureShimOutcome $shim $generated
+            [IO.File]::WriteAllBytes($shim,(New-Object byte[] 121856))
+        }
+        $shimBefore=Get-FixtureShimFingerprint $shim
+        $shimBefore.status=(Get-VmpowerPackageShimState $packageTools).status
+        if ($family.shimCase -eq 'unrelated-sentinel') {
+            Assert-True ($shimBefore.status -ceq 'UNQUALIFIED_PRESERVED') 'Unrelated sentinel was qualified'
+        }
+        $familyEvidence.shimBefore=@{classification=$shimBefore.status;sha256=$shimBefore.sha256;bytes=$shimBefore.bytes}
         $familyEvidence.phases+=@('legacy-registration-scripts-skipped')
         $Evidence.phase='synthetic-service-setup'
         # Reuse only qualified modern Node bytes for the legacy SCM contract.
@@ -242,8 +288,9 @@ function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
         $null=Invoke-OwnedChocolatey @('upgrade','vmpower-agent','--version=0.0.2',('--source='+$packages),'--yes','--limit-output')
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'New package did not replace legacy registration'
         # Product behavior must pass before any fixture reconciliation can run.
-        Assert-True (-not (Test-Path -LiteralPath $shim)) 'Product upgrade left the obsolete legacy shim'
-        $familyEvidence.phases+=@('product-removes-qualified-legacy-shim')
+        Assert-FixtureShimOutcome $shim $shimBefore
+        $familyEvidence.shimAfterUpgrade='PASS'
+        $familyEvidence.phases+=@('product-shim-preservation-or-qualified-removal')
         $modern=Join-Path $product ('Agent\releases\'+$prepared.bundles.bundle+'\runtime\node.exe')
         $service=Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'"
         if ($disabled) {
@@ -261,7 +308,8 @@ function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
         Assert-True $script:packageRecoveryObserved 'Failure did not reach installer service recovery'
         $null=Wait-Condition { (Receiver-State).count -gt $count };$null=Service-Child $modern
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'Failed package did not restore prior registration'
-        Assert-True (-not (Test-Path -LiteralPath $shim)) 'Failed modern successor recreated a legacy shim'
+        Assert-FixtureShimOutcome $shim $shimBefore
+        $familyEvidence.shimAfterCrashingSuccessor='PASS'
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Package rollback changed configuration'
         $familyEvidence.phases+=@('package-and-service-rollback')
         $Evidence.phase='post-activation-shim-failure-rollback'
@@ -276,26 +324,32 @@ function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
         }
         $null=Wait-Condition { (Receiver-State).count -gt $count };$null=Service-Child $modern
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Finalization rollback changed configuration'
-        Assert-True ((Test-Path -LiteralPath $shim) -and [IO.File]::ReadAllText($shim) -ceq 'synthetic unrelated replacement after activation') 'Finalization rollback changed unrelated shim'
+        if ($shimBefore.status -eq 'UNQUALIFIED_PRESERVED') {
+            Assert-FixtureShimOutcome $shim $shimBefore
+        } else {
+            Assert-True ((Test-Path -LiteralPath $shim) -and [IO.File]::ReadAllText($shim) -ceq 'synthetic unrelated replacement after activation') 'Finalization rollback changed unrelated shim'
+            # Exact adverse sentinel created above, removed only after assertions.
+            Remove-Item -LiteralPath $shim
+        }
+        $familyEvidence.shimAfterFinalizationFailure='PASS'
         $familyEvidence.phases+=@('post-activation-shim-failure-restores-package-service')
-        # Remove only the exact sentinel this adverse control created, after its
-        # preservation and service/package compensation assertions succeeded.
-        Remove-Item -LiteralPath $shim
         $Evidence.phase='modern-package-uninstall'
         # Run the NEW uninstaller normally, proving old destructive script is gone.
         $null=Invoke-OwnedChocolatey @('uninstall','vmpower-agent','--yes','--limit-output')
         Assert-True (-not (Get-OwnedChocolateyVersion)) 'Modern package registration remains'
-        Assert-True (-not (Test-Path -LiteralPath $shim)) 'Product uninstall requires fixture shim rescue'
+        Assert-FixtureShimOutcome $shim $shimBefore
+        $familyEvidence.shimAfterNormalUninstall='PASS'
         $null=Wait-Condition { -not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'") }
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Modern package uninstall deleted configuration'
         Assert-True (Test-Path -LiteralPath $modern) 'Package uninstall deleted rollback runtime'
         $familyEvidence.phases+=@('modern-uninstall-retains-config-runtime')
-        $proof+=@(@{family=$family.name;packageSha256=$family.sha;registrationUpgrade='PASS';previousState=$(if ($disabled) {'Stopped/Disabled'} else {'Running/Manual'});serviceRollback='PASS';uninstallPreservesConfig='PASS';legacyPublishedExecutable='UNRUN'})
+        $proof+=@(@{family=$family.name;shimCase=$family.shimCase;shimDisposition=$shimBefore.status;packageSha256=$family.sha;registrationUpgrade='PASS';previousState=$(if ($disabled) {'Stopped/Disabled'} else {'Running/Manual'});serviceRollback='PASS';uninstallPreservesConfig='PASS';legacyPublishedExecutable='UNRUN'})
         $Evidence.phase='family-package-cleanup'
         $familyEvidence.shimCleanup=Remove-OwnedChocolateyRegistration
-        $familyEvidence.phases+=@('package-and-shim-cleanup')
+        $familyEvidence.phases+=@('fixture-package-and-shim-cleanup')
         Remove-Item -LiteralPath $localPackage
     }
     $Evidence.phase='complete';$Evidence.status='PASS';$Evidence.chocolateyVersion=$ExpectedChocolateyVersion
-    return @{phase='real-chocolatey-ownership-synthetic-service';status='PASS';chocolateyVersion=$ExpectedChocolateyVersion;packages=$packedProof;families=$proof;oldRuntimeCompatibility='UNQUALIFIED'}
+    return @{phase='real-chocolatey-ownership-synthetic-service';status='PASS';chocolateyVersion=$ExpectedChocolateyVersion;packages=$packedProof;families=$proof;
+        serviceMigration='PASS';unqualifiedCommandDisposition='PRESERVED_BY_PRODUCT';fullLegacyCleanup='NOT_CLAIMED';oldRuntimeCompatibility='UNQUALIFIED'}
 }

@@ -32,7 +32,7 @@ function Get-VmpowerPackageShimState([string]$ToolsDirectory) {
     if ($global:productShimChangeOnRecheck -and $global:productShimProofCalls -eq 2) { [IO.File]::WriteAllText($file,'replacement during uninstall') }
     if (-not (Test-Path -LiteralPath $file)) { return @{status='ABSENT';path=$file} }
     if ([IO.File]::ReadAllText($file) -cne 'owned synthetic shim') { throw 'unowned fixture shim' }
-    return @{status='QUALIFIED_LEGACY';path=$file;sha256=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash;bytes=(Get-Item $file).Length}
+    return @{status='QUALIFIED_LEGACY';path=$file;sha256=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash;bytes=(Get-Item $file).Length;fileIdentity='synthetic';acl='synthetic'}
 }
 '@
     [IO.File]::WriteAllText((Join-Path $tools 'package-shim.ps1'),$helper)
@@ -82,6 +82,53 @@ function Get-VmpowerPackageShimState([string]$ToolsDirectory) {
             Assert-Rejected { & (Join-Path $tools 'chocolateyUninstall.ps1') } 'denied shim during uninstall'
         }
         Assert-True ($global:productShimServiceCalls -eq $before -and (Test-Path -LiteralPath $shim)) 'Denied shim failure removed service'
+        # Exercise the real proof/hash/ACL/identity and hook code. Only the fixed
+        # supported root is mapped into this owned test directory; no global
+        # Chocolatey path or service is touched by these modeled controls.
+        $realHelper=[IO.File]::ReadAllText((Join-Path $source 'package-shim.ps1')).Replace(
+            "'C:\ProgramData\chocolatey'",("'"+$product.Replace("'","''")+"'"))
+        [IO.File]::WriteAllText((Join-Path $tools 'package-shim.ps1'),$realHelper)
+        . ([ScriptBlock]::Create($realHelper))
+        Set-ProtectedAcl $product $true;Set-ProtectedAcl $bin $true
+        [IO.File]::WriteAllBytes($shim,(New-Object byte[] 121856));Set-ProtectedAcl $shim $false
+        $unknown=Get-VmpowerPackageShimState $tools
+        Assert-True ($unknown.status -ceq 'UNQUALIFIED_PRESERVED') 'Unknown bytes were adopted or refused solely by hash'
+        function Assert-UnknownUnchanged {
+            $after=Get-VmpowerPackageShimState $tools
+            foreach ($field in @('status','sha256','bytes','acl','fileIdentity')) {
+                Assert-True ($after[$field] -ceq $unknown[$field]) ('Unknown shim changed: '+$field)
+            }
+        }
+        $before=$global:productShimServiceCalls
+        & (Join-Path $tools 'chocolateyInstall.ps1')
+        Assert-UnknownUnchanged
+        Assert-True ($global:productShimServiceCalls -eq ($before+1)) 'Preserved unknown shim blocked independent activation'
+        $global:productShimInstallerFails=$true
+        Assert-Rejected { & (Join-Path $tools 'chocolateyInstall.ps1') } 'unknown shim with failed activation'
+        $global:productShimInstallerFails=$false;Assert-UnknownUnchanged
+        $before=$global:productShimServiceCalls
+        & (Join-Path $tools 'chocolateyUninstall.ps1')
+        Assert-UnknownUnchanged
+        Assert-True ($global:productShimServiceCalls -eq ($before+1)) 'Preserved unknown shim blocked independent service removal'
+        # Adversarial fixture replacement, not product behavior: retain the old
+        # inode while creating identical bytes, so identity must distinguish it.
+        $held=Join-Path $bin 'fixture-held-shim'
+        Move-Item -LiteralPath $shim -Destination $held
+        [IO.File]::WriteAllBytes($shim,(New-Object byte[] 121856));Set-ProtectedAcl $shim $false
+        Assert-Rejected { Remove-VmpowerPackageShim $tools $unknown } 'same-byte file replacement'
+        Assert-True ((Get-VmpowerPackageShimState $tools).sha256 -ceq $unknown.sha256) 'Replacement bytes changed'
+        Remove-Item -LiteralPath $shim;Move-Item -LiteralPath $held -Destination $shim
+        Set-ProtectedAcl $shim $false $true
+        Assert-Rejected { Remove-VmpowerPackageShim $tools $unknown } 'unknown shim ACL changed'
+        Assert-True (Test-Path -LiteralPath $shim) 'ACL-changed unknown shim deleted'
+        Set-ProtectedAcl $shim $false;Assert-UnknownUnchanged
+        $before=$global:productShimServiceCalls
+        $lock=[IO.File]::Open($shim,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try {
+            Assert-Rejected { & (Join-Path $tools 'chocolateyInstall.ps1') } 'unknown shim read denied'
+            Assert-True ($global:productShimServiceCalls -eq $before) 'Unreadable unknown shim allowed service mutation'
+        } finally { $lock.Dispose() }
+        Assert-UnknownUnchanged
         # Actual proof helper, without stubbing: custom roots/locations must fail
         # closed, and an absent shim needs no inferred ownership.
         . (Join-Path $source 'package-shim.ps1')
@@ -89,7 +136,7 @@ function Get-VmpowerPackageShimState([string]$ToolsDirectory) {
         Assert-Rejected { Get-VmpowerPackageShimState $bin } 'foreign tools location'
         Remove-Item -LiteralPath $shim
         Assert-True ((Get-VmpowerPackageShimState $tools).status -ceq 'ABSENT') 'Actual absent-shim proof failed'
-        return 13
+        return 19
     } finally {
         $env:ChocolateyInstall=$originalRoot
         foreach ($name in @('productShimFile','productShimServiceCalls','productShimInstallerFails','productShimChanges','productShimProofCalls','productShimChangeOnRecheck')) {

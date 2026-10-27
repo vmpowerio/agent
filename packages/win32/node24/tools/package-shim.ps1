@@ -31,22 +31,38 @@ function Get-VmpowerPackageShimState([string]$ToolsDirectory) {
         throw 'Unrecognized legacy shim file; shim preserved'
     }
     Assert-SingleLinkFile $shim
-    $sha=(Get-FileHash -LiteralPath $shim -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Read without write/delete sharing: this is a preservation snapshot, not an
+    # ownership claim for unknown bytes. Include identity and ACL to reject a
+    # same-byte replacement or permission change during the service transaction.
+    $stream=[IO.File]::Open($shim,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $hasher=$null
+    try {
+        $hasher=[Security.Cryptography.SHA256]::Create()
+        $info=New-Object VMPower.FileLinks+Info
+        if (-not [VMPower.FileLinks]::GetFileInformationByHandle($stream.SafeFileHandle,[ref]$info) -or
+            $info.Links -ne 1 -or $stream.Length -ne 121856) { throw 'Unrecognized legacy shim file; shim preserved' }
+        $sha=([BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+        $identity=('{0:x8}:{1:x8}:{2:x8}' -f $info.Volume,$info.IndexHigh,$info.IndexLow)
+        $sddl=(Get-Acl -LiteralPath $shim).Sddl
+    } finally { if ($hasher) { $hasher.Dispose() };$stream.Dispose() }
+    $status='QUALIFIED_LEGACY'
     if ($sha -cnotin @('7d7dad5068622170edda0e1fa6ecfe906ed39cc8727186b404c4c1add1482795',
         '00e537c680019d69bba7a2906c1338f600059ca27c40de93f710faf25f0015b6')) {
-        throw 'Unqualified legacy shim bytes; shim preserved'
+        $status='UNQUALIFIED_PRESERVED'
     }
-    return @{status='QUALIFIED_LEGACY';path=$shim;sha256=$sha;bytes=$file.Length}
+    return @{status=$status;path=$shim;sha256=$sha;bytes=$file.Length;fileIdentity=$identity;acl=$sddl}
 }
 
 function Remove-VmpowerPackageShim([string]$ToolsDirectory,[hashtable]$Before) {
     # Recheck after the service transaction; a changed/new file is not ours to delete.
     $current=Get-VmpowerPackageShimState $ToolsDirectory
     if ($current.path -ine $Before.path -or $current.status -cne $Before.status -or
-        ($current.status -eq 'QUALIFIED_LEGACY' -and $current.sha256 -cne $Before.sha256)) {
+        ($current.status -ne 'ABSENT' -and ($current.sha256 -cne $Before.sha256 -or
+            $current.bytes -ne $Before.bytes -or $current.fileIdentity -cne $Before.fileIdentity -or
+            $current.acl -cne $Before.acl))) {
         throw 'Shim changed during package operation; shim preserved'
     }
-    if ($current.status -eq 'ABSENT') { return }
+    if ($current.status -in @('ABSENT','UNQUALIFIED_PRESERVED')) { return }
     Remove-Item -LiteralPath $current.path -Force
     if (Test-Path -LiteralPath $current.path) { throw 'Qualified legacy shim removal failed' }
 }

@@ -143,6 +143,26 @@ class WindowsPackageInputs(unittest.TestCase):
         self.assertEqual(result['nupkgSha256'], digest(packed.read_bytes()))
         self.assertEqual(result['bundleManifestSha256'], self.expected)
 
+    def test_resealed_bundle_cannot_claim_legacy_shim_basename(self):
+        (self.bundle / 'app/VMPower-Agent.AMD64.EXE').write_bytes(b'synthetic unrelated bytes')
+        self.seal()
+        with self.assertRaisesRegex(ValueError, 'legacy shim basename'): self.prepare()
+        self.assertFalse(self.output.exists())
+
+    def test_consistent_pack_inputs_cannot_adopt_legacy_command_or_drop_suppression(self):
+        self.prepare()
+        extra = self.output / 'tools/VMPower-Agent.AMD64.EXE'
+        extra.write_bytes(b'synthetic unrelated bytes')
+        with self.assertRaisesRegex(ValueError, 'legacy shim basename'):
+            verification.verify(self.output, self.packed_fixture())
+        extra.unlink()
+        for name in ('tools/node.exe.ignore', 'tools/nssm.exe.ignore'):
+            marker = self.output / name
+            marker.write_bytes(b'changed marker')
+            with self.assertRaisesRegex(ValueError, 'suppression marker'):
+                verification.verify(self.output, self.packed_fixture())
+            marker.write_bytes(b'')
+
     def test_packed_tamper_missing_shim_and_extra_executable_rejected(self):
         self.prepare()
         mutations = [

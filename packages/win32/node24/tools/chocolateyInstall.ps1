@@ -3,7 +3,8 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts\install-windows-bundle.ps1')
 . (Join-Path $PSScriptRoot 'package-shim.ps1')
-# Reject ambiguous legacy shim ownership before any service/configuration change.
+# Refuse unsafe structure before service/configuration changes. Unknown bytes at
+# the protected path remain unqualified and must survive the whole transaction.
 $previousShim=Get-VmpowerPackageShimState $PSScriptRoot
 $packageTools=$PSScriptRoot
 $inputRecord = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'package-input.json') | ConvertFrom-Json

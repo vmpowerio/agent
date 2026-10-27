@@ -1,68 +1,51 @@
-# Windows Chocolatey ownership handoff (prepared, not distributed)
+# Windows Chocolatey service migration (prepared, not distributed)
 
-Native run `40437980932` passed the prior `18d6aef` source on Windows 2025,
-PowerShell 5.1 and Chocolatey 2.7.4. That pass included fixture removal of an
-orphan legacy shim; it did not prove product-side shim cleanup. The following
-product-hook correction is source-only until a new admitted native run passes.
+Run `40451298149` at `e6b320a` passed the Windows path controls, 32 PowerShell
+controls, four modeled transaction controls and nine bundle lifecycle phases.
+Its first docs-family package upgrade failed with `SHIM_HASH_UNQUALIFIED`;
+independent fixture cleanup passed. Actual package upgrade and compensation did
+not pass. The earlier `0e9dc09` failure remains Unknown; this later diagnosis does
+not retroactively identify its cause. No replacement package has been published.
 
-Run `40445133666` at `0e9dc09` subsequently passed 26 preflight controls, four
-modeled finalization-state controls and the original nine lifecycle phases, but
-failed at the first docs-family modern package upgrade. Cleanup passed separately.
-No actual product shim handoff or post-activation package compensation passed in
-that run. Its underlying Chocolatey error was not retained, so the cause remains
-Unknown. The qualifier now maps captured output only to a closed set of fixed
-shim/installer labels; unrecognized errors become `UNKNOWN`. It never writes raw
-output, paths, credentials or excerpts. Six redaction controls include secret-like
-unknown errors and recognized errors mixed with secret-like text. New diagnostic
-execution remains unrun until an admitted native job proves it.
+The product now distinguishes service migration from the global legacy command.
+At the exact protected `C:\ProgramData\chocolatey\bin\vmpower-agent.amd64.exe`
+path, a regular 121856-byte single-link file with safe parents and ACLs may be
+`UNQUALIFIED_PRESERVED` when its SHA-256 is outside the two observed pins. This
+is a preservation decision, never an ownership or executable-safety claim.
+The file is never executed, deleted, moved, overwritten or adopted by the product.
+Other root/path/type/link/size/ACL failures still refuse migration.
 
-Do not assume repeatable shim SHA-256 from a fixed Chocolatey version. The
-[official ShimGen repository](https://github.com/chocolatey/shimgen) says its
-generator is closed source; its published shim code is reference source, not the
-generator/build pipeline. Chocolatey's versioned generation caller supplies path,
-output, icon and optional GUI inputs, but provides no byte-reproducibility contract.
-The two observed hashes remain narrowly accepted evidence, not proof of all
-future generated shims. Hash drift is only an untested explanation for this run;
-do not add hashes or weaken ownership without actual discriminating evidence.
+The before/after snapshot includes bytes, SHA-256, ACL and Windows file identity.
+A replacement (even identical bytes), ACL change or denied read fails within the
+existing service activation rollback transaction. Only an unchanged shim with
+one of the two exact approved hashes may be removed. Uninstall reconciles this
+same decision before removing the service and preserves configuration, releases,
+wrapper and old copied executable. Missing shims are harmless.
 
-The product hooks now preflight the exact `bin\vmpower-agent.amd64.exe` path and
-remove it inside the recoverable activation transaction, or before service removal
-on uninstall. Existing shims must match
-one of the two exact SHA-256/size pairs observed from the pinned legacy packages
-in that run, under `C:\ProgramData\chocolatey`, with protected ownership/ACLs,
-no reparse points and a single link. Unknown bytes, custom roots, unsafe parents
-or an intervening replacement fail closed and preserve the file. Missing shims
-are harmless. No shim or legacy executable is executed to identify its target.
-Older Chocolatey-generated shim variants are not qualified by these two hashes.
+The modern archive cannot contain the legacy EXE basename; the builder and packed
+archive verifier independently enforce this. Both Node and NSSM require empty
+Chocolatey ignore markers. Actual Chocolatey upgrade/rollback/uninstall must still
+prove that its automatic shim handling leaves unknown bytes, ACL and file identity
+unchanged. Native checks cover both generated package-family shims and a separate
+same-size unrelated sentinel. Fixture-only reconciliation runs after preservation
+assertions and actual package deregistration; it is not product cleanup.
 
 Both old package scripts register the service against the copied
-`C:\ProgramData\vmpower\vmpower.exe`, not Chocolatey's automatic global shim.
-The inspected dashboard install command and published help pages use Chocolatey
-installation/service reporting, not that shim. Its removal therefore cleans up
-an obsolete automatic command; the old copied executable is retained for rollback
-and the modern release keeps its existing `vmpower.cmd`. Uninspected external
-scripts that invoke the old global EXE are not claimed compatible.
+`C:\ProgramData\vmpower\vmpower.exe`, not the automatic global shim. The modern
+service uses its qualified runtime and existing launcher. A preserved unknown
+command remains unsupported and potentially points at old software; service
+migration must not be reported as full legacy cleanup or zero security exposure.
+Post-success rollback to the old package remains unqualified: its old install
+script overwrites configuration, and an in-memory failure snapshot is not a
+persistent operator rollback command.
 
-The native package test requires the legacy shim before upgrade, its absence
-immediately after the product upgrade and after ordinary product uninstall, all
-before emergency fixture cleanup. The existing preflight also runs product-hook
-wiring controls with synthetic ownership/service boundaries, plus real helper
-refusal controls. Those local wiring controls do not replace actual shim proof.
-Post-success rollback to legacy is still unqualified: in-memory installer failure
-recovery is not a persistent operator rollback command, and normal old-package
-downgrade would overwrite configuration.
-
-The first product correction (`0416667`) incorrectly removed the shim after the
-service transaction returned. A changed/locked/denied shim could then fail the
-package operation while leaving the service on the new runtime. The successor
-places both Chocolatey ignore-marker restoration and shim removal inside the
-installer's activation catch boundary. Compensation restores wrapper, application,
-arguments, directory, NSSM startup mode and prior running/stopped state; failures
-remain failures. Uninstall reconciles the shim before touching the service.
-Controls exercise changed, locked, denied and marker failures through the actual
-installer with modeled SCM; a synthetic native package additionally requires
-real Chocolatey registration and actual service/child/config restoration while
-preserving the unrelated replacement. This is source preparation, not native proof.
+Do not infer deterministic shim bytes from a pinned Chocolatey version. The
+[official ShimGen repository](https://github.com/chocolatey/shimgen) provides
+reference shim source, but its generator is closed source. No hashes are added by
+this change. Raw package output is mapped to fixed diagnostic labels only;
+unrecognized errors stay `UNKNOWN`, without paths, credentials or excerpts.
+This source and its new Windows assertions remain unrun until separately admitted
+native qualification.
 
 Use the existing `vmpower-agent` package ID with an explicit version greater than
 `0.0.1`. A normal Chocolatey upgrade invokes the **new** install script after the
@@ -143,7 +126,8 @@ modern inputs. The job must have no customer/provider/package secrets and no
 persisted checkout credential; any job token is read-only. Do not run on a
 customer host, self-hosted runner or machine with existing agent registration.
 
-For each exact old package, the fixture registers the real bytes using
+For each exact old package, plus one separate unrelated-sentinel case after both
+generated-shim cases, the fixture registers the real bytes using
 `--skip-automation-scripts --ignore-dependencies` and a local-only source. This is
 **registration-only evidence**, not proof that the old software was installed or
 works. The old executable and both old PowerShell scripts are never invoked.
@@ -154,7 +138,7 @@ uninstall, without script-skipping, to test:
 - replacement of the actual `0.0.1` package registration;
 - running/manual and stopped/disabled service preservation and configuration ACLs;
 - a crashing modern child restoring prior package registration and service progress;
-- new uninstall preserving configuration and retained runtime;
+- new uninstall preserving configuration, retained runtime and unqualified command bytes/ACL/file identity;
 - removal of owned package registration, exact caches, legacy shim, service,
   processes, firewall rules and fixture inputs.
 
@@ -164,8 +148,10 @@ unmodified product `bundle`, not the synthetic comment-bearing `upgrade` bundle;
 the default lifecycle fixture still checks that separate synthetic upgrade.
 A final version and retained deliverable artifact require separate root admission.
 The `0.0.4` fixture uses the explicitly synthetic upgrade bundle and a labeled
-test finalizer. It must fail after activation, preserve the replacement sentinel,
-and restore `0.0.2` package/service state before ordinary uninstall is tested.
+test finalizer. It denies reads of a preserved shim, or introduces a replacement
+when the known shim was already removed. Failure must occur after activation,
+restore `0.0.2` package/service state, and preserve the adverse or unqualified
+file before ordinary uninstall is tested.
 Cleanup skips all old automation and the auto-uninstaller, including
 when upgrade failed while `0.0.1` remains registered. Exact package directories and
 the legacy shim must be absent before ownership is recorded. A cleanup failure

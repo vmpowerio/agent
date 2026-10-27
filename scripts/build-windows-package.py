@@ -40,6 +40,8 @@ def prepare(bundle, expected, node_archive, nssm_archive, version, output, repo=
     if stage.digest(regular(bundle / 'bundle-manifest.json')) != expected:
         raise ValueError('Bundle manifest hash mismatch')
     manifest = stage.verify_bundle(bundle)
+    if any(Path(name).name.casefold() == 'vmpower-agent.amd64.exe' for name in manifest['files']):
+        raise ValueError('Modern package must not claim the legacy shim basename')
     runtime_pins = json.loads(regular(repo / 'distribution/runtime-pins.json'))
     if manifest['target'] != 'win-x64' or manifest['nodeVersion'] != runtime_pins['nodeVersion']:
         raise ValueError('Expected pinned Windows x64 bundle')

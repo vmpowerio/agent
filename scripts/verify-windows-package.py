@@ -21,6 +21,11 @@ def verify(inputs, packed):
             if name == 'tools/node.exe.ignore':
                 name = 'tools/bundle/runtime/node.exe.ignore'
             expected[name] = file.read_bytes()
+    if any(Path(name).name.casefold() == 'vmpower-agent.amd64.exe' for name in expected):
+        raise ValueError('Modern package must not claim the legacy shim basename')
+    for marker in ('tools/nssm.exe.ignore', 'tools/bundle/runtime/node.exe.ignore'):
+        if expected.get(marker) != b'':
+            raise ValueError('Required empty shim suppression marker missing or changed')
     record = json.loads(expected['tools/package-input.json'])
     with zipfile.ZipFile(packed) as archive:
         names = archive.namelist()
