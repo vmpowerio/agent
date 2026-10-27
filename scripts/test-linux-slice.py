@@ -174,7 +174,7 @@ class SliceTests(unittest.TestCase):
                 # systemd255 loads optional-fragment slices during named GetAll.
                 return mock.Mock(stdout='loaded')
             with mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(isolation,'unit_group',side_effect=lambda key:root/key):isolation.admit_units()
-            self.assertEqual(len(calls),3);self.assertIn('--all',calls[0])
+            self.assertEqual(len(calls),2);self.assertIn('--all',calls[0])
             self.assertEqual(calls[-1],('systemctl','show','--property=UnitPath','--value'))
     def test_unloaded_files_dropins_and_dangling_masks_are_collisions(self):
         for key in ('slice','qualify','cleanup'):
@@ -189,13 +189,33 @@ class SliceTests(unittest.TestCase):
                         with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
                     self.assertEqual(caught.exception.reason,'DROPIN' if kind=='dropin' else 'UNIT_FILE');self.assertEqual(caught.exception.resource,key)
     def test_memory_and_installed_enumeration_refuse_any_exact_unit(self):
-        for verb in ('list-units','list-unit-files'):
+        for verb in ('list-units',):
             for state in ('loaded inactive dead','not-found inactive dead','loaded active running transient'):
                 with self.subTest(verb=verb,state=state):
                     def execute(*args,**kwargs):return mock.Mock(stdout=isolation.names()['slice']+' '+state if args[1]==verb else '')
                     with mock.patch.object(commands,'run',side_effect=execute):
                         with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
-                    self.assertEqual(caught.exception.reason,'LOADED_UNIT' if verb=='list-units' else 'UNIT_FILE')
+                    self.assertEqual(caught.exception.reason,'LOADED_UNIT')
+    def test_empty_unit_file_match_exit_one_never_becomes_an_admission_query(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);calls=[]
+            def execute(*args,**kwargs):
+                calls.append(args)
+                if args[1]=='list-unit-files':raise commands.CommandFailure({'operation':'SYSTEMCTL','classification':'EXIT_NONZERO','exitCode':1})
+                return mock.Mock(stdout=str(root/'units') if args[1]=='show' else '')
+            with mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(isolation,'unit_group',side_effect=lambda key:root/key):isolation.admit_units()
+            self.assertFalse(any(args[1]=='list-unit-files' for args in calls))
+    def test_each_query_failure_has_a_closed_query_tag(self):
+        for tag in ('LIST_UNITS','MANAGER_UNIT_PATH'):
+            with self.subTest(tag=tag),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                def execute(*args,**kwargs):
+                    current='LIST_UNITS' if args[1]=='list-units' else 'MANAGER_UNIT_PATH'
+                    if current==tag:raise commands.CommandFailure({'operation':'SYSTEMCTL','classification':'EXIT_NONZERO','exitCode':1})
+                    return mock.Mock(stdout='')
+                with mock.patch.object(commands,'run',side_effect=execute):
+                    with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
+                self.assertEqual(isolation.failure_record(caught.exception,'UNIT_ADMISSION'),{'phase':'UNIT_ADMISSION','resource':'local','reason':'QUERY_FAILED','query':tag})
     def test_malformed_queries_and_unreadable_metadata_fail_closed(self):
         for raw in ('','relative/path','/safe/../other','/safe\nunsafe','/safe;unexpected'):
             with self.subTest(raw=raw):
@@ -208,7 +228,8 @@ class SliceTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason,'PARSE_FAILED');self.assertNotIn('sensitive',str(caught.exception))
         failure=commands.CommandFailure({'operation':'SYSTEMCTL','classification':'EXIT_NONZERO'})
         with mock.patch.object(commands,'run',side_effect=failure):
-            with self.assertRaises(commands.CommandFailure):isolation.admit_units()
+            with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
+        self.assertEqual(caught.exception.reason,'QUERY_FAILED');self.assertEqual(caught.exception.query,'LIST_UNITS')
         with mock.patch.object(Path,'lstat',side_effect=PermissionError('withheld')):
             with self.assertRaises(PermissionError):isolation.occupied(Path('/unreadable'))
     def test_exclusive_policy_creation_preserves_raced_file(self):

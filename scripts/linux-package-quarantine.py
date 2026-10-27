@@ -11,8 +11,9 @@ DROP=SYSTEM/'vmpower.service.d'
 PROBE=Path('/opt/vmpower-agent-qualification/slice-probe.py')
 
 class AdmissionRefused(RuntimeError):
-    def __init__(self,reason,resource='local'):
-        self.reason=reason;self.resource=resource
+    def __init__(self,reason,resource='local',query=None):
+        if query not in (None,'LIST_UNITS','MANAGER_UNIT_PATH'):raise ValueError('FIXTURE_QUERY_TAG_REFUSED')
+        self.reason=reason;self.resource=resource;self.query=query
         super().__init__('FIXTURE_ISOLATION_UNIT_COLLISION' if reason in ('LOADED_UNIT','UNIT_FILE','DROPIN','CGROUP') else 'FIXTURE_ISOLATION_ADMISSION_REFUSED')
 
 def failure_record(exc,phase):
@@ -20,7 +21,12 @@ def failure_record(exc,phase):
             'QUERY_FAILED' if isinstance(exc,commands.CommandFailure) else
             'SIGNAL' if isinstance(exc,commands.Interrupted) else
             'IO_FAILED' if isinstance(exc,OSError) else 'UNKNOWN')
-    return {'phase':phase,'resource':exc.resource if isinstance(exc,AdmissionRefused) else 'local','reason':reason}
+    return {'phase':phase,'resource':exc.resource if isinstance(exc,AdmissionRefused) else 'local','reason':reason,
+            **({'query':exc.query} if isinstance(exc,AdmissionRefused) and exc.query else {})}
+
+def admission_query(tag,*args):
+    try:return commands.run(*args).stdout
+    except commands.CommandFailure:raise AdmissionRefused('QUERY_FAILED',query=tag) from None
 
 def occupied(target):
     try:Path(target).lstat();return True
@@ -166,18 +172,16 @@ def admit_units():
     # file creation, systemd-run or stop. Named property queries load an absent
     # implicit slice, so enumerate existing objects without querying those names.
     n=names();keys=('slice','qualify','cleanup');units=[n[key] for key in keys]
-    for verb,reason in (('list-units','LOADED_UNIT'),('list-unit-files','UNIT_FILE')):
-        args=['systemctl',verb,'--plain','--full','--no-legend','--no-pager']
-        if verb=='list-units':args.append('--all')
-        rows=commands.run(*args,*units).stdout.splitlines()
-        for row in rows:
-            if not row.strip():continue
-            unit=row.split()[0]
-            if unit not in units:raise AdmissionRefused('PARSE_FAILED')
-            raise AdmissionRefused(reason,keys[units.index(unit)])
+    rows=admission_query('LIST_UNITS','systemctl','list-units','--plain','--full','--no-legend','--no-pager','--all',*units).splitlines()
+    for row in rows:
+        if not row.strip():continue
+        unit=row.split()[0]
+        if unit not in units:raise AdmissionRefused('PARSE_FAILED')
+        raise AdmissionRefused('LOADED_UNIT',keys[units.index(unit)])
     # The manager's lookup paths include control, transient and generator units.
-    # Drop-in-only definitions and dangling masks may be absent from both lists.
-    raw=commands.run('systemctl','show','--property=UnitPath','--value').stdout.strip()
+    # Exact lstat covers unloaded fragments and masks as well as drop-in-only
+    # definitions. A redundant list-unit-files query exits 1 on an empty match.
+    raw=admission_query('MANAGER_UNIT_PATH','systemctl','show','--property=UnitPath','--value').strip()
     paths=raw.split()
     if not paths or len(paths)>64:raise AdmissionRefused('PARSE_FAILED')
     for directory in paths:
