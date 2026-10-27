@@ -109,6 +109,18 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
     $shim=Join-Path $env:ChocolateyInstall 'bin\vmpower-agent.amd64.exe'
     Assert-NoReparsePoint $shim;Assert-True (-not (Test-Path -LiteralPath $shim)) 'Legacy shim already exists'
     $owned.chocolatey=$script:chocolatey;$owned.chocolateyDirectories=@($directories);$owned.chocolateyShim=$shim;$owned.chocolateyShimAbsent=$true;Save-Json $journal $owned
+    # Actual product proof must reject an unrelated regular file, even at the
+    # right protected path and exact expected size. Never execute this sentinel.
+    . (Join-Path $PSScriptRoot '../packages/win32/node24/tools/package-shim.ps1')
+    $Evidence.phase='product-shim-ownership-refusal'
+    [IO.File]::WriteAllBytes($shim,(New-Object byte[] 121856))
+    $sentinelHash=(Get-FileHash -LiteralPath $shim -Algorithm SHA256).Hash
+    $rejected=$false
+    try { $null=Get-VmpowerPackageShimState (Join-Path $env:ChocolateyInstall 'lib\vmpower-agent\tools') } catch { $rejected=$true }
+    Assert-True ($rejected -and (Test-Path -LiteralPath $shim) -and
+        (Get-FileHash -LiteralPath $shim -Algorithm SHA256).Hash -ceq $sentinelHash) 'Product proof accepted or changed an unrelated shim'
+    Remove-Item -LiteralPath $shim
+    $Evidence.unrelatedShimRefusal='PASS'
     $packages=Join-Path $Output 'chocolatey-ownership';$null=New-Item -ItemType Directory -Path $packages
     $runtimePins=Get-Content -Raw (Join-Path $PSScriptRoot '../distribution/runtime-pins.json') | ConvertFrom-Json
     $nodeArchive=Join-Path $Output $runtimePins.targets.'win-x64'.archive
@@ -148,6 +160,7 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
             '--yes','--skip-automation-scripts','--ignore-dependencies','--limit-output')
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.1') 'Legacy ownership not registered'
         Assert-True (-not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'")) 'Skipped legacy install created a service'
+        Assert-True (Test-Path -LiteralPath $shim -PathType Leaf) 'Legacy automatic shim missing; migration control not exercised'
         $familyEvidence.phases+=@('legacy-registration-scripts-skipped')
         $Evidence.phase='synthetic-service-setup'
         # Reuse only qualified modern Node bytes for the legacy SCM contract.
@@ -166,6 +179,9 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
         $Evidence.phase='modern-package-upgrade'
         $null=Invoke-OwnedChocolatey @('upgrade','vmpower-agent','--version=0.0.2',('--source='+$packages),'--yes','--limit-output')
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'New package did not replace legacy registration'
+        # Product behavior must pass before any fixture reconciliation can run.
+        Assert-True (-not (Test-Path -LiteralPath $shim)) 'Product upgrade left the obsolete legacy shim'
+        $familyEvidence.phases+=@('product-removes-qualified-legacy-shim')
         $modern=Join-Path $product ('Agent\releases\'+$prepared.bundles.bundle+'\runtime\node.exe')
         $service=Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'"
         if ($disabled) {
@@ -183,11 +199,13 @@ function Invoke-WindowsPackageOwnership([string]$LegacyPackages,[string]$Expecte
         Assert-True $script:packageRecoveryObserved 'Failure did not reach installer service recovery'
         $null=Wait-Condition { (Receiver-State).count -gt $count };$null=Service-Child $modern
         Assert-True ((Get-OwnedChocolateyVersion) -ceq '0.0.2') 'Failed package did not restore prior registration'
+        Assert-True (-not (Test-Path -LiteralPath $shim)) 'Failed modern successor recreated a legacy shim'
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Package rollback changed configuration'
         $familyEvidence.phases+=@('package-and-service-rollback');$Evidence.phase='modern-package-uninstall'
         # Run the NEW uninstaller normally, proving old destructive script is gone.
         $null=Invoke-OwnedChocolatey @('uninstall','vmpower-agent','--yes','--limit-output')
         Assert-True (-not (Get-OwnedChocolateyVersion)) 'Modern package registration remains'
+        Assert-True (-not (Test-Path -LiteralPath $shim)) 'Product uninstall requires fixture shim rescue'
         $null=Wait-Condition { -not (Get-CimInstance Win32_Service -Filter "Name='vmpoweragent'") }
         Assert-True ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ceq $configDigest) 'Modern package uninstall deleted configuration'
         Assert-True (Test-Path -LiteralPath $modern) 'Package uninstall deleted rollback runtime'

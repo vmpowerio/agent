@@ -1,5 +1,36 @@
 # Windows Chocolatey ownership handoff (prepared, not distributed)
 
+Native run `40437980932` passed the prior `18d6aef` source on Windows 2025,
+PowerShell 5.1 and Chocolatey 2.7.4. That pass included fixture removal of an
+orphan legacy shim; it did not prove product-side shim cleanup. The following
+product-hook correction is source-only until a new admitted native run passes.
+
+The product hooks now preflight the exact `bin\vmpower-agent.amd64.exe` path and
+remove it only after successful activation/removal. Existing shims must match
+one of the two exact SHA-256/size pairs observed from the pinned legacy packages
+in that run, under `C:\ProgramData\chocolatey`, with protected ownership/ACLs,
+no reparse points and a single link. Unknown bytes, custom roots, unsafe parents
+or an intervening replacement fail closed and preserve the file. Missing shims
+are harmless. No shim or legacy executable is executed to identify its target.
+Older Chocolatey-generated shim variants are not qualified by these two hashes.
+
+Both old package scripts register the service against the copied
+`C:\ProgramData\vmpower\vmpower.exe`, not Chocolatey's automatic global shim.
+The inspected dashboard install command and published help pages use Chocolatey
+installation/service reporting, not that shim. Its removal therefore cleans up
+an obsolete automatic command; the old copied executable is retained for rollback
+and the modern release keeps its existing `vmpower.cmd`. Uninspected external
+scripts that invoke the old global EXE are not claimed compatible.
+
+The native package test requires the legacy shim before upgrade, its absence
+immediately after the product upgrade and after ordinary product uninstall, all
+before emergency fixture cleanup. The existing preflight also runs product-hook
+wiring controls with synthetic ownership/service boundaries, plus real helper
+refusal controls. Those local wiring controls do not replace actual shim proof.
+Post-success rollback to legacy is still unqualified: in-memory installer failure
+recovery is not a persistent operator rollback command, and normal old-package
+downgrade would overwrite configuration.
+
 Use the existing `vmpower-agent` package ID with an explicit version greater than
 `0.0.1`. A normal Chocolatey upgrade invokes the **new** install script after the
 **old** before-modify script. It does not run the old uninstall script. Both

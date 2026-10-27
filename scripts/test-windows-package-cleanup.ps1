@@ -88,7 +88,9 @@ try {
     Test-FailurePreservation $true $true;$cases++
     Test-FailurePreservation $true $false;$cases++
     Test-FailurePreservation $false $true;$cases++
-    @{status='PASS';cases=$cases;packageOperations=0;serviceOperations=0;legacyExecutableRuns=0} | ConvertTo-Json -Compress
+    . (Join-Path $PSScriptRoot 'test-windows-product-shim.ps1')
+    $productCases=Test-WindowsProductShim $fixture
+    @{status='PASS';cases=($cases+$productCases);originalControls=$cases;productHookControls=$productCases;productHookOwnershipProof='synthetic in wiring controls; actual proof in native package phases';packageOperations=0;serviceOperations=0;legacyExecutableRuns=0} | ConvertTo-Json -Compress
 } finally {
     $env:ChocolateyInstall=$originalRoot
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }

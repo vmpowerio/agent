@@ -30,6 +30,7 @@ class WindowsPackageInputs(unittest.TestCase):
             (self.repo / relative).mkdir(parents=True)
         for relative in ('scripts/install-windows-bundle.ps1',
                          'packages/win32/node24/tools/chocolateyInstall.ps1',
+                         'packages/win32/node24/tools/package-shim.ps1',
                          'packages/win32/node24/tools/chocolateyUninstall.ps1'):
             shutil.copyfile(ROOT / relative, self.repo / relative)
         (self.repo / 'package-lock.json').write_bytes(b'fixture lock, not a dependency graph')
@@ -85,6 +86,8 @@ class WindowsPackageInputs(unittest.TestCase):
         self.assertEqual((self.output / 'tools/scripts/install-windows-bundle.ps1').read_bytes(),
                          (ROOT / 'scripts/install-windows-bundle.ps1').read_bytes())
         self.assertFalse((self.output / 'tools/chocolateyBeforeModify.ps1').exists())
+        self.assertEqual((self.output / 'tools/package-shim.ps1').read_bytes(),
+                         (ROOT / 'packages/win32/node24/tools/package-shim.ps1').read_bytes())
         self.assertFalse(any(p.name == 'vmpower-agent.amd64.exe' for p in self.output.rglob('*')))
         self.assertEqual(json.loads((self.output / 'tools/package-input.json').read_text())['bundleManifestSha256'], self.expected)
 

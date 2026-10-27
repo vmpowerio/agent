@@ -76,7 +76,7 @@ def prepare(bundle, expected, node_archive, nssm_archive, version, output, repo=
         (tools / 'nssm.exe.ignore').write_bytes(b'')
         (tools / 'node.exe.ignore').write_bytes(b'')
         (tools / 'NSSM-LICENSE.txt').write_bytes(license_bytes)
-        for name in ('chocolateyInstall.ps1', 'chocolateyUninstall.ps1'):
+        for name in ('chocolateyInstall.ps1', 'chocolateyUninstall.ps1', 'package-shim.ps1'):
             (tools / name).write_bytes(regular(repo / 'packages/win32/node24/tools' / name))
         for relative in ('scripts/install-windows-bundle.ps1', 'distribution/nssm-pins.json'):
             target = tools / relative
