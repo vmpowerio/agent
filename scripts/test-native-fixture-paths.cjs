@@ -93,13 +93,12 @@ async function fixture(check) {
 function windowsHelperModel(root = 'C:\\Windows', killStatus = 0) {
   const { EventEmitter } = require('node:events');
   const { PassThrough } = require('node:stream');
-  const source = fs.readFileSync(__filename, 'utf8');
   const child = new EventEmitter();
   child.pid = 1234; child.stdout = new PassThrough(); child.stderr = new PassThrough();
   const calls = [], timers = [], host = { platform: 'win32', env: { SystemRoot: root } };
   const helper = require('node:vm').runInNewContext(
-    source.slice(source.indexOf('function runHelper('), source.indexOf('async function fixture(')) + '\nrunHelper',
-    { process: host, helperDeadline, path,
+    '(' + runHelper.toString() + ')',
+    { process: host, helperDeadline,
       spawn(...args) { calls.push(['spawn', ...args]); return child; },
       spawnSync(...args) { calls.push(['kill', ...args]); return { status: killStatus }; },
       setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {} });
