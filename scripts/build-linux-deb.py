@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tarfile
 
@@ -83,6 +84,63 @@ def build(bundle,expected,version,output):
     fd=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,'wb') as handle:handle.write(raw);handle.flush();os.fsync(handle.fileno())
     return {'package':'vmpower-agent','version':version,'architecture':'amd64','sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw),'bundleManifestSha256':expected,'maintainerHookSha256':hashlib.sha256(controls['postinst'][0]).hexdigest(),'files':len(payload)}
+
+
+def read_package(path):
+    """Reopen our fixed three-member deb without extracting or executing anything."""
+    before=path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or not 0<before.st_size<=160*1024*1024:
+        raise ValueError('Bounded nonempty single-link package required')
+    with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW),'rb') as handle:
+        opened=os.fstat(handle.fileno())
+        if (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino):raise ValueError('Package changed while opening')
+        raw=handle.read(160*1024*1024+1)
+        after=os.fstat(handle.fileno())
+    current=path.lstat()
+    if len(raw)!=before.st_size or any((s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns)!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns) for s in (after,current)):
+        raise ValueError('Package changed while reading')
+    if raw[:8]!=b'!<arch>\n':raise ValueError('Invalid deb archive')
+    position=8;members={}
+    for name in ('debian-binary','control.tar.gz','data.tar.gz'):
+        header=raw[position:position+60]
+        try:size=int(header[48:58])
+        except ValueError:raise ValueError('Invalid deb member size') from None
+        expected=f'{name+"/":<16}{0:<12}{0:<6}{0:<6}{"100644":<8}{size:<10}`\n'.encode()
+        if header!=expected or not 0<size<=len(raw)-position-60:raise ValueError('Invalid deb member')
+        members[name]=raw[position+60:position+60+size];position+=60+size
+        if size%2:
+            if raw[position:position+1]!=b'\n':raise ValueError('Invalid deb padding')
+            position+=1
+    if position!=len(raw) or members['debian-binary']!=b'2.0\n':raise ValueError('Unexpected deb members')
+    archives={}
+    for name in ('control.tar.gz','data.tar.gz'):
+        files={};seen=set();total=0
+        with gzip.GzipFile(fileobj=io.BytesIO(members[name])) as compressed:
+            tar=compressed.read(512*1024*1024+1)
+        if len(tar)>512*1024*1024:raise ValueError('Uncompressed archive bound exceeded')
+        with tarfile.open(fileobj=io.BytesIO(tar),mode='r:') as archive:
+            for entry in archive:
+                total+=entry.size
+                if len(seen)>=20000 or entry.size<0 or total>512*1024*1024 or entry.name in seen:raise ValueError('Archive bounds or duplicate member')
+                seen.add(entry.name)
+                if not entry.name.startswith('./') or any(x in ('','..','.') for x in entry.name[2:].split('/')) or entry.uid or entry.gid or entry.mtime:
+                    raise ValueError('Unexpected archive metadata')
+                if entry.isdir():
+                    if entry.mode!=0o755 or entry.size:raise ValueError('Unexpected directory metadata')
+                elif entry.isfile():files[entry.name[2:]]=(archive.extractfile(entry).read(),entry.mode)
+                else:raise ValueError('Package links or special files refused')
+        expected_names={'./'+f for f in files}|{'./'+str(parent) for f in files for parent in Path(f).parents if str(parent)!='.'}
+        if seen!=expected_names:raise ValueError('Unexpected archive directory inventory')
+        archives[name]=files
+    return {'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)},archives
+
+
+def verify_package(path,bundle,expected,version,receipt):
+    measured,archives=read_package(path)
+    if measured!={k:receipt[k] for k in ('sha256','bytes')}:raise ValueError('Retained package size/hash mismatch')
+    payload,controls=package_files(bundle,expected,version)
+    if archives!={'data.tar.gz':payload,'control.tar.gz':controls}:raise ValueError('Reopened package differs from qualified inputs')
+    return {**measured,'archiveReopened':True,'exactControlAndData':True,'files':len(payload)}
 
 
 if __name__=='__main__':

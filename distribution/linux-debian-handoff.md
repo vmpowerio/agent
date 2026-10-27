@@ -1,8 +1,8 @@
 # Linux Debian ownership and rollback candidate
 
 This source prepares one package builder and the actual maintainer hooks for a
-future release. It is not published or customer-qualified. The optional native
-gate below has not run. The current public binaries remain unchanged.
+future release. It is not published or customer-qualified. The final-version
+retention extension below has not run. The current public binaries remain unchanged.
 
 The two cached public Linux packages are both `vmpower-agent` version `0.1`, with
 different executable bytes. They own `/usr/bin/vmpower`,
@@ -101,8 +101,36 @@ before any push; this source preparation has not dispatched CI.
    that registration **before dropping quarantine**, verifies absence, stops the
    exact watchdog, removes owned state, stops all owned
    processes/receivers, removes firewall rules and restores the original `/opt`
-   permissions. Upload sanitized lifecycle/cleanup JSON only; no packages,
-   configuration bytes, raw environments or snapshots.
+   permissions. Upload sanitized lifecycle/cleanup JSON and, only after successful
+   qualification, the final package described below. Exclude synthetic packages,
+   configuration bytes, raw environments and snapshots.
+
+## Final-version retention prerequisite
+
+The Linux job additionally builds `vmpower-agent_0.2.0_amd64.deb` from the original
+unmodified compiled bundle, never the synthetic upgrade/crash variant. Its source
+commit/tree, run/attempt, original pinned Node archive, application lock, bundle
+manifest and included licenses are bound in a sanitized manifest. Before each
+actual final-package dpkg install, a separate read requires a nonzero bounded
+regular single-link archive, computes its size and SHA256, reopens its control/data
+archives, and compares every payload, hook and mode with the original inputs.
+Neither a builder receipt nor a zero-byte metadata field substitutes for this read.
+
+After all existing adverse phases, each exact cached legacy family is installed
+again without executing Node10. The same retained final archive must upgrade it,
+preserve config bytes and stopped/disabled state, own the package paths, run as the
+service user and produce two reports before purge preserves config. This adds two
+existing bounded 85-second report waits; the 750-second scope and 15-minute job
+limits are unchanged. Actual runtime fit remains an execution prerequisite.
+
+Only successful lifecycle, both final-family report proofs, supervisor and cleanup
+receipts, removed isolation, and a final independent archive reopen/hash allow the
+two exact files under `evidence/final-linux/` to upload for three days. No wildcard
+package upload, release, tag, public consumer URL or publishing action is added.
+This prepares retention; only an admitted native run can produce the actual package
+and lifecycle evidence. Post-success rollback remains **UNQUALIFIED**: the adverse
+fixture's failed-upgrade compensation is not proof of recovery after successful
+customer installation. Customer OS compatibility remains Unknown.
 
 Expected incremental gate work is two package-family matrices within the existing
 15-minute Linux job. The two-report waits alone need about 60 seconds per family;

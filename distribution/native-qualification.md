@@ -4,10 +4,13 @@ Root review and CI/budget admission precede a push. The prepared workflow
 `.github/workflows/native-qualification.yml` has one standard Ubuntu 24.04 x64 job
 (15 minutes) and one standard Windows 2025 x64 job (20 minutes). It runs on this
 delivery branch/master pushes and master PRs, with read-only contents permission,
-no customer/provider secrets, no dispatch/release/tag event and no binary artifact
-publishing. Existing source/CodeQL jobs remain separate and count toward admission.
-Only sanitized JSON qualification receipts are uploaded for three days; package
-bytes, synthetic configuration, login rows and raw service environments are excluded.
+no customer/provider secrets and no dispatch/release/tag event or release publishing.
+Existing source/CodeQL jobs remain separate and count toward admission. Sanitized
+JSON qualification receipts are uploaded for three days. After successful Linux
+lifecycle and cleanup, a separate three-day artifact retains only the exact final
+`vmpower-agent_0.2.0_amd64.deb` and its sanitized provenance manifest; the success-only
+gate reopens and hashes that archive again. Synthetic package variants,
+configuration, login rows and raw service environments are excluded.
 Download only the pinned public Node and NSSM inputs and public npm packages before
 enforcing outbound isolation. Record exact runner OS, kernel/libc or Windows build
 and PowerShell version. These results do not establish Windows 10/Server 2016,

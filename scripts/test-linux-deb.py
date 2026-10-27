@@ -82,6 +82,132 @@ class PackageTests(unittest.TestCase):
         with mock.patch.object(builder.installer.stage,'verify_bundle',side_effect=race):
             with self.assertRaisesRegex(ValueError,'during packaging'):self.build()
         self.assertFalse(self.output.exists())
+    def test_final_archive_reopened_independently_with_exact_control_payload_and_license(self):
+        receipt=self.build('0.2.0')
+        proof=builder.verify_package(self.output,self.bundle,self.digest,'0.2.0',receipt)
+        self.assertGreater(proof['bytes'],0);self.assertEqual(proof['bytes'],self.output.stat().st_size)
+        self.assertEqual(proof['sha256'],hashlib.sha256(self.output.read_bytes()).hexdigest())
+        self.assertTrue(proof['archiveReopened'] and proof['exactControlAndData'])
+        _,archives=builder.read_package(self.output)
+        self.assertIn('usr/lib/vmpower-agent/bundle/runtime/LICENSE',archives['data.tar.gz'])
+        self.assertNotIn('etc/vmpower.conf',archives['data.tar.gz'])
+    def test_zero_size_receipt_and_rc_archive_cannot_qualify_as_final(self):
+        receipt=self.build()
+        with self.assertRaisesRegex(ValueError,'differs'):builder.verify_package(self.output,self.bundle,self.digest,'0.2.0',receipt)
+        with self.assertRaisesRegex(ValueError,'size/hash'):builder.verify_package(self.output,self.bundle,self.digest,'0.2.0~rc1',{**receipt,'bytes':0})
+    def test_empty_truncated_trailing_or_changed_archive_refused(self):
+        receipt=self.build('0.2.0');original=self.output.read_bytes()
+        for raw in (b'',original[:50],original[:-1],original+b'extra',b'badmagic'+original[8:]):
+            with self.subTest(size=len(raw)):
+                self.output.write_bytes(raw)
+                with self.assertRaises(ValueError):builder.verify_package(self.output,self.bundle,self.digest,'0.2.0',receipt)
+    def test_rehashed_unexpected_config_or_hook_is_not_an_accepted_archive(self):
+        receipt=self.build('0.2.0');payload,controls=builder.package_files(self.bundle,self.digest,'0.2.0')
+        variants=[({**payload,'etc/vmpower.conf':(b'fixture only',0o600)},controls),(payload,{**controls,'postinst':(b'altered hook',0o755)})]
+        for data,control in variants:
+            raw=builder.ar_bytes([('debian-binary',b'2.0\n'),('control.tar.gz',builder.tar_bytes(control)),('data.tar.gz',builder.tar_bytes(data))]);self.output.write_bytes(raw)
+            updated={**receipt,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
+            with self.assertRaisesRegex(ValueError,'differs'):builder.verify_package(self.output,self.bundle,self.digest,'0.2.0',updated)
+    def test_archive_links_and_excessive_member_size_refused_without_extraction(self):
+        for kind in ('link','oversize'):
+            stream=io.BytesIO()
+            with tarfile.open(fileobj=stream,mode='w:gz') as archive:
+                entry=tarfile.TarInfo('./unexpected')
+                if kind=='link':entry.type=tarfile.SYMTYPE;entry.linkname='/outside'
+                else:entry.size=512*1024*1024+1
+                archive.addfile(entry)
+            self.output.write_bytes(builder.ar_bytes([('debian-binary',b'2.0\n'),('control.tar.gz',stream.getvalue()),('data.tar.gz',stream.getvalue())]))
+            with self.subTest(kind=kind),self.assertRaisesRegex(ValueError,'links|bounds'):builder.read_package(self.output)
+    def test_linked_package_and_oversize_file_refused_before_open(self):
+        self.build('0.2.0');alias=self.output.with_name('alias.deb');alias.symlink_to(self.output)
+        with self.assertRaisesRegex(ValueError,'single-link'):builder.read_package(alias)
+        alias.unlink();os.link(self.output,alias)
+        with self.assertRaisesRegex(ValueError,'single-link'):builder.read_package(self.output)
+        alias.unlink()
+        with self.output.open('wb') as handle:handle.truncate(160*1024*1024+1)
+        with mock.patch.object(builder.os,'open',side_effect=AssertionError('Must not open excessive input')):
+            with self.assertRaisesRegex(ValueError,'single-link'):builder.read_package(self.output)
+    def test_final_bundle_requires_original_runtime_source_and_unmodified_application(self):
+        manifest=dpkg_fixture.final_bundle(builder,self.fixture.root,self.digest,self.fixture.repo)
+        self.assertEqual(manifest['nodeVersion'],'24.22.1')
+        (self.fixture.repo/'build/index.js').write_text('different compiled application')
+        with self.assertRaisesRegex(ValueError,'unmodified'):dpkg_fixture.final_bundle(builder,self.fixture.root,self.digest,self.fixture.repo)
+    def test_synthetic_fixture_cannot_be_retained_even_with_consistent_manifest_hash(self):
+        file=self.bundle/'bundle-manifest.json';manifest=json.loads(file.read_bytes());manifest['qualification']='SYNTHETIC LIFECYCLE FIXTURE; NEVER PUBLISH'
+        file.write_text(json.dumps(manifest));digest=hashlib.sha256(file.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError,'unmodified'):dpkg_fixture.final_bundle(builder,self.fixture.root,digest,self.fixture.repo)
+    def test_original_runtime_archive_must_still_match_pin(self):
+        with self.fixture.archive.open('ab') as handle:handle.write(b'changed archive')
+        with self.assertRaisesRegex(ValueError,'pinned'):dpkg_fixture.final_bundle(builder,self.fixture.root,self.digest,self.fixture.repo)
+
+
+class RetainedGateTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture=fixtures.BundleTests();self.fixture.setUp();self.addCleanup(self.fixture.doCleanups)
+        self.bundle=self.fixture.bundle();self.out=self.fixture.root;self.evidence=self.out/'evidence';self.directory=self.evidence/'final-linux';self.directory.mkdir(parents=True)
+        digest=hashlib.sha256((self.bundle/'bundle-manifest.json').read_bytes()).hexdigest()
+        self.package=builder.build(self.bundle,digest,'0.2.0',self.directory/dpkg_fixture.FINAL_NAME)
+        self.identity={'repository':'vmpowerio/agent','source':'a'*40,'tree':'b'*40,'runId':'123','attempt':'1','job':'linux-native'}
+        bundle=json.loads((self.bundle/'bundle-manifest.json').read_bytes())
+        self.manifest={**self.identity,'status':'NATIVE_FIXTURE_QUALIFIED_NOT_RELEASED','package':self.package,
+            **{k:bundle[k] for k in ('applicationVersion','nodeVersion','runtimeArchiveSha256','sourceLockSha256')},
+            'legacyFamilies':sorted(dpkg_fixture.LEGACY),'postSuccessRollback':'UNQUALIFIED','customerOSCompatibility':'Unknown','licensesIncluded':['runtime/LICENSE']}
+        proof=builder.verify_package(self.directory/dpkg_fixture.FINAL_NAME,self.bundle,digest,'0.2.0',self.package)
+        families=[{'name':name,'phases':[{'phase':'retained-final-0.2.0-direct-legacy-upgrade-and-two-reports','status':'PASS','archive':proof,'reportsObserved':2}]} for name in dpkg_fixture.LEGACY]
+        self.lifecycle={'status':'PASS','head':self.identity['source'],'realPackageOwnership':{'status':'PASS','finalPackage':self.manifest,'packages':{'final':self.package},'families':families}}
+        self.write(self.directory/'manifest.json',self.manifest);self.write(self.evidence/'lifecycle-linux.json',self.lifecycle)
+        self.cleanup={'status':'PASS',**{k:True for k in ('serviceAbsent','childrenAbsent','managedFilesAbsent','packageRegistrationAbsent')}}
+        self.write(self.evidence/'cleanup-linux.json',self.cleanup);self.write(self.evidence/'supervisor-outcome-linux.json',{'status':'PASS'});self.write(self.out/'isolation.json',{'state':'REMOVED'})
+        import native_fixture_paths
+        for patch in (mock.patch.object(native_fixture_paths,'require_output',return_value=self.out),mock.patch.object(dpkg_fixture,'final_identity',return_value=self.identity)):
+            patch.start();self.addCleanup(patch.stop)
+    def write(self,file,value):file.write_text(json.dumps(value))
+    def verify(self):
+        with mock.patch('sys.stdout',new_callable=io.StringIO) as output:
+            result=dpkg_fixture.verify_retained(self.out)
+            self.assertEqual(set(json.loads(output.getvalue())),{'retainedFinalPackage','bytes','sha256','release','customerDelivery'})
+            return result
+    def test_success_gate_keeps_exact_final_bytes_and_explicit_unreleased_limits(self):
+        before=(self.directory/dpkg_fixture.FINAL_NAME).read_bytes();self.assertEqual(self.verify(),self.manifest)
+        self.assertEqual((self.directory/dpkg_fixture.FINAL_NAME).read_bytes(),before)
+        self.assertEqual(self.manifest['postSuccessRollback'],'UNQUALIFIED')
+    def test_any_cleanup_or_quarantine_failure_blocks_retention(self):
+        for key in ('serviceAbsent','childrenAbsent','managedFilesAbsent','packageRegistrationAbsent'):
+            self.write(self.evidence/'cleanup-linux.json',{**self.cleanup,key:False})
+            with self.subTest(key=key),self.assertRaisesRegex(ValueError,'cleanup'):self.verify()
+        self.write(self.evidence/'cleanup-linux.json',self.cleanup)
+        for file,value in ((self.evidence/'supervisor-outcome-linux.json',{'status':'FAIL'}),(self.out/'isolation.json',{'state':'INSTALLED'})):
+            original=file.read_bytes();self.write(file,value)
+            with self.assertRaisesRegex(ValueError,'not complete'):self.verify()
+            file.write_bytes(original)
+    def test_source_drift_and_missing_family_report_block_retention(self):
+        self.write(self.directory/'manifest.json',{**self.manifest,'source':'c'*40})
+        with self.assertRaisesRegex(ValueError,'source/job'):self.verify()
+        self.write(self.directory/'manifest.json',self.manifest)
+        self.lifecycle['realPackageOwnership']['families'][1]['phases'][0]['reportsObserved']=1
+        self.write(self.evidence/'lifecycle-linux.json',self.lifecycle)
+        with self.assertRaisesRegex(ValueError,'reports'):self.verify()
+    def test_zero_size_or_changed_final_archive_blocks_retention(self):
+        file=self.directory/dpkg_fixture.FINAL_NAME;original=file.read_bytes()
+        for raw in (b'',original+b'extra'):
+            file.write_bytes(raw)
+            with self.assertRaises(ValueError):self.verify()
+    def test_extra_config_or_unknown_manifest_fields_block_retention(self):
+        extra=self.directory/'config.json';extra.write_text('synthetic only')
+        with self.assertRaisesRegex(ValueError,'inventory'):self.verify()
+        extra.unlink();self.write(self.directory/'manifest.json',{**self.manifest,'config':'synthetic only'})
+        with self.assertRaisesRegex(ValueError,'schema'):self.verify()
+    def test_preinstall_proof_cannot_use_zero_byte_receipt(self):
+        self.lifecycle['realPackageOwnership']['families'][0]['phases'][0]['archive']['bytes']=0
+        self.write(self.evidence/'lifecycle-linux.json',self.lifecycle)
+        with self.assertRaisesRegex(ValueError,'pre-install'):self.verify()
+    def test_manifest_cannot_misstate_included_licenses(self):
+        self.manifest['licensesIncluded']=[]
+        self.write(self.directory/'manifest.json',self.manifest);self.write(self.evidence/'lifecycle-linux.json',self.lifecycle)
+        with self.assertRaisesRegex(ValueError,'license'):self.verify()
+    def test_linked_manifest_refused(self):
+        file=self.directory/'manifest.json';target=self.out/'other.json';file.rename(target);file.symlink_to(target)
+        with self.assertRaisesRegex(ValueError,'regular'):self.verify()
 
 
 class HookTests(unittest.TestCase):
@@ -168,6 +294,11 @@ class HookTests(unittest.TestCase):
 
 
 class NativeBoundaryTests(unittest.TestCase):
+    def test_final_identity_rejects_wrong_job_repo_source_and_noncanonical_run(self):
+        env={'QUALIFIED_SOURCE_SHA':'a'*40,'QUALIFIED_SOURCE_TREE':'b'*40,'GITHUB_REPOSITORY':'vmpowerio/agent','GITHUB_JOB':'linux-native','GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}
+        with mock.patch.dict(os.environ,env,clear=True):self.assertEqual(dpkg_fixture.final_identity()['runId'],'123')
+        for key,value in [('GITHUB_JOB','windows-native'),('GITHUB_REPOSITORY','other/agent'),('QUALIFIED_SOURCE_SHA',''),('QUALIFIED_SOURCE_TREE','c'*39),('GITHUB_RUN_ID','00123'),('GITHUB_RUN_ATTEMPT','0')]:
+            with self.subTest(key=key),mock.patch.dict(os.environ,{**env,key:value},clear=True),self.assertRaises((ValueError,RuntimeError)):dpkg_fixture.final_identity()
     def test_slice_refuses_mac_before_reading_ownership(self):
         with mock.patch.object(quarantine.sys,'platform','darwin'):
             with self.assertRaisesRegex(RuntimeError,'HOST_REFUSED'):quarantine.begin(native,Path('/not-used'),1234)

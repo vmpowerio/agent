@@ -38,12 +38,15 @@ jobs:
           node scripts/test-native-report-fixture.cjs
           node scripts/test-native-fixture-paths.cjs
       - name: Stage pinned official runtime and labeled fixtures
-        run: python3 scripts/prepare-native-inputs.py --output "$RUNNER_TEMP/vmpower-native"
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFIED_SOURCE_SHA"
+          echo "QUALIFIED_SOURCE_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          python3 scripts/prepare-native-inputs.py --output "$RUNNER_TEMP/vmpower-native"
       - name: Stage exact retained public Debian package families before quarantine
         run: python3 scripts/prepare-legacy-package-inputs.py --output "$RUNNER_TEMP/vmpower-native"
       - name: Isolated systemd lifecycle and progress
         run: |
-          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,GITHUB_JOB,GITHUB_REPOSITORY,QUALIFIED_SOURCE_SHA,QUALIFIED_SOURCE_TREE,ImageOS,ImageVersion,RUNNER_TEMP \
             python3 scripts/linux-package-quarantine.py --output "$RUNNER_TEMP/vmpower-native" --legacy-dpkg
       - name: Always reconcile owned fixture cleanup
         if: always()
@@ -59,6 +62,18 @@ jobs:
           name: native-linux-receipts
           path: ${{ runner.temp }}/vmpower-native/evidence/*.json
           if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Reopen retained final package after successful lifecycle and cleanup
+        run: python3 -B scripts/qualify-linux-dpkg.py --verify-retained "$RUNNER_TEMP/vmpower-native"
+      - name: Retain exact qualified final Linux package only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: final-linux-package-${{ env.QUALIFIED_SOURCE_SHA }}
+          path: |
+            ${{ runner.temp }}/vmpower-native/evidence/final-linux/vmpower-agent_0.2.0_amd64.deb
+            ${{ runner.temp }}/vmpower-native/evidence/final-linux/manifest.json
+          if-no-files-found: error
           retention-days: 3
 
   windows-native:

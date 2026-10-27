@@ -5,16 +5,20 @@ Both exact legacy packages are installed as data/metadata, with their known
 postinst and pre-existing synthetic config. Their Node10 executables never run.
 Only the built package's actual hooks activate the qualified modern runtime.
 """
+import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import pwd
+import re
 import stat
 import sys
 
 sys.dont_write_bytecode=True
 PACKAGE='vmpower-agent'
+FINAL_NAME='vmpower-agent_0.2.0_amd64.deb'
 EXTRA_PATHS=[Path('/usr/lib/vmpower-agent'),Path('/var/lib/vmpower-agent'),Path('/etc/vmpower-template.conf')]
 LEGACY={
     'dashboard-linux.deb':{'bytes':10794560,'sha256':'06bf0d767e4625db0477f3e23e30b4e36ac6e7a7d50882b3c655c472f45875b1','binarySha256':'6e26bae20a2d0a45135c0b8591d41982175cff5b844ffcd2c3a610b1b49e3a80'},
@@ -72,6 +76,71 @@ def assert_nonroot_child(native,expected):
     return pid
 
 
+def final_identity():
+    source=os.environ.get('QUALIFIED_SOURCE_SHA','');tree=os.environ.get('QUALIFIED_SOURCE_TREE','')
+    if not re.fullmatch('[a-f0-9]{40}',source) or not re.fullmatch('[a-f0-9]{40}',tree):raise ValueError('Exact final source identity required')
+    if os.environ.get('GITHUB_REPOSITORY')!='vmpowerio/agent' or os.environ.get('GITHUB_JOB')!='linux-native':raise ValueError('Final package job route refused')
+    return {'repository':'vmpowerio/agent','source':source,'tree':tree,'runId':quarantine().canonical_run_id(os.environ.get('GITHUB_RUN_ID','')),
+            'attempt':quarantine().canonical_run_id(os.environ.get('GITHUB_RUN_ATTEMPT','')),'job':'linux-native'}
+
+
+def final_bundle(builder,out,expected,root):
+    manifest=builder.installer.stage.verify_bundle(out/'bundle')
+    if (manifest.get('qualification')!='Staged bytes only; native execution, installer/service and release acceptance are separate.' or
+            manifest['applicationVersion']!=json.loads((root/'package.json').read_text())['version'] or
+            manifest['sourceLockSha256']!=hashlib.sha256((root/'package-lock.json').read_bytes()).hexdigest() or
+            manifest['files']['app/index.js']!=hashlib.sha256((root/'build/index.js').read_bytes()).hexdigest() or
+            hashlib.sha256((out/'bundle/bundle-manifest.json').read_bytes()).hexdigest()!=expected):
+        raise ValueError('Only the unmodified compiled bundle may be retained')
+    pins=json.loads((root/'distribution/runtime-pins.json').read_text())
+    pin=pins['targets']['linux-x64']
+    runtime=builder.installer.stage.runtime_files(out/pin['archive'],'linux-x64',pins)
+    if manifest['runtimeArchiveSha256']!=pin['sha256'] or manifest['nodeVersion']!=pins['nodeVersion']:raise ValueError('Original runtime archive binding failed')
+    if any((out/'bundle/runtime'/name).read_bytes()!=raw for name,raw in runtime.items()):raise ValueError('Runtime/license differs from original pinned archive')
+    return manifest
+
+
+def verify_retained(out):
+    """Success-only upload gate; same retained bytes, no rebuild or config export."""
+    from native_fixture_paths import require_output
+    out=require_output(out);directory=out/'evidence/final-linux'
+    if directory.is_symlink() or {p.name for p in directory.iterdir()}!={FINAL_NAME,'manifest.json'}:raise ValueError('Unexpected retained inventory')
+    info=(directory/'manifest.json').lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or not 0<info.st_size<=65536:raise ValueError('Bounded regular final manifest required')
+    manifest=json.loads((directory/'manifest.json').read_text())
+    if set(manifest)!={'repository','source','tree','runId','attempt','job','status','package','applicationVersion','nodeVersion','runtimeArchiveSha256','sourceLockSha256','legacyFamilies','postSuccessRollback','customerOSCompatibility','licensesIncluded'}:raise ValueError('Final manifest schema refused')
+    if set(manifest['package'])!={'package','version','architecture','sha256','bytes','bundleManifestSha256','maintainerHookSha256','files'}:raise ValueError('Final package schema refused')
+    if any(manifest['package'][k]!=v for k,v in {'package':'vmpower-agent','version':'0.2.0','architecture':'amd64'}.items()):raise ValueError('Final package identity refused')
+    if manifest['legacyFamilies']!=sorted(LEGACY) or manifest['customerOSCompatibility']!='Unknown':raise ValueError('Final cohort evidence refused')
+    if any(manifest[k]!=v for k,v in final_identity().items()):raise ValueError('Retained source/job identity mismatch')
+    evidence=out/'evidence';lifecycle=json.loads((evidence/'lifecycle-linux.json').read_text())
+    cleanup=json.loads((evidence/'cleanup-linux.json').read_text());supervisor=json.loads((evidence/'supervisor-outcome-linux.json').read_text())
+    isolation=json.loads((out/'isolation.json').read_text())
+    if lifecycle['status']!='PASS' or lifecycle['head']!=manifest['source'] or supervisor['status']!='PASS' or isolation['state']!='REMOVED':raise ValueError('Final qualification not complete')
+    if cleanup['status']!='PASS' or not all(cleanup[k] is True for k in ('serviceAbsent','childrenAbsent','managedFilesAbsent','packageRegistrationAbsent')):raise ValueError('Final cleanup not proved')
+    qualified=lifecycle['realPackageOwnership']
+    if qualified['status']!='PASS' or qualified['finalPackage']!=manifest:raise ValueError('Final lifecycle binding mismatch')
+    if qualified['packages']['final']!=manifest['package'] or sorted(f['name'] for f in qualified['families'])!=sorted(LEGACY):raise ValueError('Final family/package evidence mismatch')
+    for family in qualified['families']:
+        phases=[p for p in family['phases'] if p['phase']=='retained-final-0.2.0-direct-legacy-upgrade-and-two-reports']
+        if len(phases)!=1 or phases[0]['status']!='PASS' or phases[0]['reportsObserved']<2:raise ValueError('Final reports not proved for both families')
+        proof=phases[0]['archive']
+        if proof!={**{k:manifest['package'][k] for k in ('sha256','bytes','files')},'archiveReopened':True,'exactControlAndData':True}:raise ValueError('Final pre-install archive binding mismatch')
+    if manifest['status']!='NATIVE_FIXTURE_QUALIFIED_NOT_RELEASED' or manifest['postSuccessRollback']!='UNQUALIFIED':raise ValueError('Final disposition mismatch')
+    spec=importlib.util.spec_from_file_location('retained_deb_builder',Path(__file__).with_name('build-linux-deb.py'))
+    builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
+    measured,archives=builder.read_package(directory/FINAL_NAME)
+    if measured!={k:manifest['package'][k] for k in ('sha256','bytes')}:raise ValueError('Retained final package changed')
+    if b'Package: vmpower-agent\nVersion: 0.2.0\nArchitecture: amd64\n' not in archives['control.tar.gz']['control'][0]:raise ValueError('Final package identity mismatch')
+    payload=archives['data.tar.gz'];raw=payload['usr/lib/vmpower-agent/bundle/bundle-manifest.json'][0];bundle=json.loads(raw)
+    if hashlib.sha256(raw).hexdigest()!=manifest['package']['bundleManifestSha256']:raise ValueError('Retained bundle manifest mismatch')
+    if any(manifest[k]!=bundle[k] for k in ('applicationVersion','nodeVersion','runtimeArchiveSha256','sourceLockSha256')):raise ValueError('Retained provenance mismatch')
+    licenses=[name for name in sorted(bundle['files']) if Path(name).name.lower().startswith(('license','copying'))]
+    if manifest['licensesIncluded']!=licenses or 'runtime/LICENSE' not in licenses:raise ValueError('Retained license inventory mismatch')
+    print(json.dumps({'retainedFinalPackage':'PASS','bytes':measured['bytes'],'sha256':measured['sha256'],'release':'UNPUBLISHED','customerDelivery':'UNRUN'}))
+    return manifest
+
+
 def qualify(native,out,installer,hashes,result):
     native.guard();out=native.require_output(out)
     legacy=verify_legacy(out/'legacy-debs')
@@ -80,8 +149,16 @@ def qualify(native,out,installer,hashes,result):
     assert owned.get('dpkgPackage')==PACKAGE and owned['paths']==[str(p) for p in native.MANAGED+EXTRA_PATHS]
     spec=importlib.util.spec_from_file_location('native_deb_builder',native.ROOT/'scripts/build-linux-deb.py')
     builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
+    identity=final_identity()
+    if json.loads((out/'evidence/prepared.json').read_text())['head']!=identity['source']:raise ValueError('Prepared source differs from final identity')
+    manifest=final_bundle(builder,out,hashes['bundle'],native.ROOT)
+    retained=out/'evidence/final-linux';retained.mkdir(mode=0o755)
+    final_path=retained/FINAL_NAME
+    final_receipt=builder.build(out/'bundle',hashes['bundle'],'0.2.0',final_path)
+    final_path.chmod(0o444)
     packages=out/'deb-packages';packages.mkdir()
     receipts=result['packages']
+    receipts['final']=final_receipt
     for name,version in [('bundle','0.2.0~rc1'),('upgrade','0.2.0~rc2'),('crashing','0.2.0~rc3')]:
         native.command('dpkg','--compare-versions',version,'gt','0.1')
         receipts[name]=builder.build(out/name,hashes[name],version,packages/(name+'.deb'))
@@ -149,5 +226,34 @@ def qualify(native,out,installer,hashes,result):
         native.command('dpkg','--purge',PACKAGE);native.wait(lambda:native.dead(pid));require_absent(native)
         assert not launcher.exists() and not unit.exists() and config.read_bytes()==raw
         phases.append({'phase':'actual-remove-reinstall-purge-preserve-config-and-retained-releases','status':'PASS'})
+        # Keep every adverse rc phase above. Qualify the exact retained final
+        # archive separately from each cached legacy family; never run Node10.
+        install_legacy(name);native.command('systemctl','daemon-reload')
+        assert package_state(native)=='installed|0.1' and hashlib.sha256(launcher.read_bytes()).hexdigest()==LEGACY[name]['binarySha256']
+        native.command('systemctl','is-active','--quiet','vmpower.service',allowed=(3,4))
+        config.chmod(0o644)
+        reopened=builder.verify_package(final_path,out/'bundle',hashes['bundle'],'0.2.0',final_receipt)
+        native.command('dpkg','--install',str(final_path))
+        assert_owned(native,hashes['bundle'],'0.2.0');assert_config(native,raw)
+        native.command('systemctl','is-active','--quiet','vmpower.service',allowed=(3,4))
+        native.command('systemctl','is-enabled','--quiet','vmpower.service',allowed=(1,3,4))
+        before=native.state(out)['count'];native.command('systemctl','start','vmpower.service')
+        installer.System().stable_child(Path('/opt/vmpower-agent/releases')/hashes['bundle']/'runtime/node')
+        pid=assert_nonroot_child(native,hashes['bundle']);native.wait(lambda:native.state(out)['count']>=before+2,85)
+        assert assert_nonroot_child(native,hashes['bundle'])==pid and native.state(out)['rejected']==0
+        phases.append({'phase':'retained-final-0.2.0-direct-legacy-upgrade-and-two-reports','status':'PASS','archive':reopened,'reportsObserved':native.state(out)['count']-before})
+        native.command('dpkg','--purge',PACKAGE);native.wait(lambda:native.dead(pid));require_absent(native)
+        assert not launcher.exists() and not unit.exists() and config.read_bytes()==raw
+        phases.append({'phase':'final-purge-preserves-config','status':'PASS'})
+    result['finalPackage']={**identity,'status':'NATIVE_FIXTURE_QUALIFIED_NOT_RELEASED','package':final_receipt,
+        'applicationVersion':manifest['applicationVersion'],'nodeVersion':manifest['nodeVersion'],'runtimeArchiveSha256':manifest['runtimeArchiveSha256'],
+        'sourceLockSha256':manifest['sourceLockSha256'],'legacyFamilies':sorted(legacy),'postSuccessRollback':'UNQUALIFIED','customerOSCompatibility':'Unknown',
+        'licensesIncluded':[name for name in sorted(manifest['files']) if Path(name).name.lower().startswith(('license','copying'))]}
+    native.write(retained/'manifest.json',result['finalPackage'])
     result.update({'status':'PASS','packageRegistrationAbsent':True,'actualCandidateHooksExecuted':True,'customerOSCompatibility':'Unknown','retainedConfigSha256':hashlib.sha256(raw).hexdigest()})
     return result
+
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser();parser.add_argument('--verify-retained',type=Path,required=True);args=parser.parse_args()
+    verify_retained(args.verify_retained)

@@ -126,6 +126,78 @@ def wait(check,timeout=15):
 def state(out):
     try:return json.loads((out/'receiver.json').read_text())
     except (FileNotFoundError,json.JSONDecodeError):return {'count':0,'port':None,'rejected':0}
+def diagnostic_json(path):
+    """Bounded metadata snapshot only; never follow links or block on a FIFO."""
+    try:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as stream:
+            before=os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or not 0<before.st_size<=4096:return 'INVALID',None
+            raw=stream.read(4097);after=os.fstat(stream.fileno())
+            if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):return 'UNVERIFIED',None
+        if len(raw)!=before.st_size:return 'UNVERIFIED',None
+        return 'VALID',json.loads(raw)
+    except FileNotFoundError:return 'MISSING',None
+    except (ValueError,UnicodeError):return 'INVALID',None
+    except OSError:return 'UNVERIFIED',None
+
+def receiver_diagnostic(out):
+    status,value=diagnostic_json(out/'receiver.json')
+    empty={'state':status,'count':None,'rejected':None,'intervalMs':None}
+    if status!='VALID':return empty
+    integer=lambda n,limit:type(n) is int and 0<=n<=limit
+    if (type(value) is not dict or set(value)!={'pid','port','count','rejected','firstReportAt','lastReportAt'} or
+        not integer(value['count'],1000000) or not integer(value['rejected'],1000000) or
+        not integer(value['pid'],2147483647) or value['pid']==0 or
+        not (value['port'] is None or integer(value['port'],65535) and value['port']>0)):
+        return {**empty,'state':'INVALID'}
+    first,last=value['firstReportAt'],value['lastReportAt'];count=value['count']
+    if count==0:
+        valid=first is None and last is None;interval=None
+    else:
+        valid=integer(first,9007199254740991) and integer(last,9007199254740991) and 0<=last-first<=86400000
+        interval=last-first if valid else None
+        valid=valid and (count!=1 or interval==0)
+    if not valid:return {**empty,'state':'INVALID'}
+    return {'state':'VALID','count':count,'rejected':value['rejected'],'intervalMs':interval}
+
+def command_diagnostic(value):
+    """Project finite labels only, even if a record contains unexpected fields."""
+    result={'operation':'UNCLASSIFIED','classification':'UNCLASSIFIED','exitCode':None}
+    if type(value) is not dict:return result
+    for key,allowed in [('operation',{'SYSTEMCTL','OWNED_SCOPE','DPKG_INSTALL','DPKG_REMOVE','DPKG_PURGE','DPKG_QUERY','SERVICE_USER','PYTHON','NODE','FIXED_HELPER'}),
+                        ('classification',{'SUCCESS','TIMEOUT','OUTPUT_LIMIT','INTERRUPTED','REAP_TIMEOUT','SIGNAL','EXIT_NONZERO'})]:
+        if type(value.get(key)) is str and value[key] in allowed:result[key]=value[key]
+    code=value.get('exitCode')
+    if type(code) is int and -64<=code<=255:result['exitCode']=code
+    return result
+
+def failure_diagnostic(exc,out):
+    """Snapshot before outer cleanup. No messages, locals, paths, IDs or timestamps."""
+    result={'category':'OTHER','locations':[],'command':None,'lastCommand':None,
+            'receiver':{'state':'UNVERIFIED','count':None,'rejected':None,'intervalMs':None}}
+    try:
+        categories={AssertionError:'ASSERTION',RuntimeError:'RUNTIME',KeyError:'KEY',ValueError:'VALUE',
+                    json.JSONDecodeError:'VALUE',TypeError:'TYPE',bounded.Interrupted:'SIGNAL',bounded.CommandFailure:'COMMAND'}
+        result['category']=categories.get(type(exc),'IO' if isinstance(exc,OSError) else 'OTHER')
+        # Full exact checkout paths, not suffix/basename matches. Keep the outer
+        # caller and last owned location within 64 frames; never inspect locals.
+        owned={str(ROOT/'scripts'/name):name for name in ('qualify-native-linux.py','install-linux-bundle.py','qualify-linux-dpkg.py','linux-package-quarantine.py','native_linux_commands.py')}
+        trace=BaseException.__traceback__.__get__(exc);locations=[]
+        for _ in range(64):
+            if trace is None:break
+            name=owned.get(trace.tb_frame.f_code.co_filename)
+            if name and 1<=trace.tb_lineno<=10000:locations.append({'script':name,'line':trace.tb_lineno})
+            trace=trace.tb_next
+        result['locations']=locations if len(locations)<=2 else [locations[0],locations[-1]]
+        if type(exc) is bounded.CommandFailure:result['command']=command_diagnostic(vars(exc).get('record'))
+        status,last=diagnostic_json(out/'evidence/operation-linux.json')
+        if status=='VALID':result['lastCommand']=command_diagnostic(last)
+        result['receiver']=receiver_diagnostic(out)
+    except BaseException:
+        # A diagnostic failure cannot replace the primary exception or cleanup.
+        pass
+    return result
 def mainpid():return int(command('systemctl','show','vmpower.service','--property=MainPID','--value').stdout.strip())
 def child(expected):
     pid=mainpid()
@@ -313,6 +385,7 @@ def qualify(out,legacy_dpkg=False):
         result['status']='PASS'
     except BaseException as exc:
         result['failure']=exc.record if isinstance(exc,bounded.CommandFailure) else {'classification':'LIFECYCLE_REFUSED_OR_INTERRUPTED'}
+        result['diagnostic']=failure_diagnostic(exc,out)
         raise
     finally:
         result['cleanup']={'status':'PENDING_OUTER_SCOPE_RECONCILIATION'}
