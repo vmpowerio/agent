@@ -98,7 +98,7 @@ def qualify(native,out,installer,hashes,result):
     config=Path('/etc/vmpower.conf');raw=config.read_bytes();unit=Path('/etc/systemd/system/vmpower.service');launcher=Path('/usr/bin/vmpower')
     families=result['families']
     for name in legacy:
-        phases=[]
+        phases=native.Phases(out,'package-'+name)
         families.append({'name':name,**LEGACY[name],'legacyBinaryExecuted':False,'legacyActiveRuntimeCompatibility':'UNRUN','phases':phases})
         install_legacy(name);native.command('systemctl','daemon-reload')
         assert package_state(native)=='installed|0.1'

@@ -1,130 +1,230 @@
 #!/usr/bin/env python3
-"""Bounded whole-runner package quarantine; only the disposable native fixture.
-
-No package script runs until both root and service-user direct socket controls
-pass. A separate-session watchdog restores runner connectivity after terminating
-the qualification process group on deadline. It never removes the service-UID
-rules, so a systemd child stays denied until the existing always-cleanup runs.
-"""
-import argparse
-import errno
-import inspect
-import json
-import os
+"""Fixture slice supervision. Never change host firewall or runner networking."""
+import argparse,ctypes,errno,inspect,json,os,platform,re,socket,sys,threading
+from contextlib import contextmanager
 from pathlib import Path
-import re
-import select
-import signal
-import socket
-import subprocess
-import sys
-import time
-
-LIMIT_SECONDS=420
-SELF=Path(__file__).resolve()
+import native_linux_commands as commands
+from native_fixture_paths import require_output
+ROOT=Path(__file__).resolve().parents[1]
+SYSTEM=Path('/run/systemd/system')
+DROP=SYSTEM/'vmpower.service.d'
+PROBE=Path('/opt/vmpower-agent-qualification/slice-probe.py')
 
 def guard():
-    if not (sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted' and os.environ.get('ImageOS')=='ubuntu24'):
-        raise RuntimeError('Package quarantine requires admitted disposable Ubuntu24')
+    if not (sys.platform=='linux' and os.geteuid()==0 and platform.machine()=='x86_64' and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted' and os.environ.get('ImageOS')=='ubuntu24'):
+        raise RuntimeError('FIXTURE_ISOLATION_HOST_REFUSED')
 
-def rules(run):
-    if not re.fullmatch(r'[0-9]+',run):raise ValueError('Numeric native run identity required')
-    return [[binary,'!','-o','lo','-m','comment','--comment','VMPOWER_PACKAGE_'+run,'-j','REJECT'] for binary in ('iptables','ip6tables')]
+def names():
+    run=os.environ.get('GITHUB_RUN_ID','')
+    if not re.fullmatch('[0-9]+',run):raise ValueError('FIXTURE_ISOLATION_RUN_REFUSED')
+    return {'run':run,'slice':'vmpowerfixture'+run+'.slice','qualify':'vmpowerqualify'+run+'.scope','cleanup':'vmpowercleanup'+run+'.scope'}
 
-def command(*args,allowed=(0,)):
-    result=subprocess.run(args,capture_output=True,text=True,timeout=15)
-    if result.returncode not in allowed:raise RuntimeError('Package quarantine command failed: '+args[0])
-    return result
+def member(pid,unit=None):
+    expected='/'+names()['slice']+'/'
+    rows=Path('/proc/'+str(pid)+'/cgroup').read_text().splitlines()
+    if len(rows)!=1 or not rows[0].startswith('0::'+expected):raise RuntimeError('FIXTURE_ISOLATION_MEMBERSHIP_REFUSED')
+    group=rows[0][3:]
+    if unit and group!=expected+unit:raise RuntimeError('FIXTURE_ISOLATION_UNIT_REFUSED')
+    return group
 
-def remove_rules(run):
-    for binary,*args in rules(run):
-        if command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode==0:
-            command(binary,'-w','-D','OUTPUT',*args)
-        if command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode!=1:
-            raise RuntimeError('Package quarantine rule remains')
+def effective_filters(group):
+    """Read-only x86_64 Linux BPF_PROG_QUERY; unsupported fails before sockets.
 
-def identity(pid):
-    try:return Path('/proc/'+str(pid)+'/stat').read_text().split(') ',1)[1].split()[19]
-    except FileNotFoundError:return None
+    Stable linux/bpf.h query ABI, effective ancestor programs, no BPF load/write.
+    This avoids installing a new privileged utility on the hosted runner.
+    """
+    guard()
+    if not group.startswith('/'+names()['slice']+'/') or '..' in group:raise RuntimeError('FIXTURE_ISOLATION_CGROUP_REFUSED')
+    class Query(ctypes.Structure):
+        _fields_=[('target_fd',ctypes.c_uint32),('attach_type',ctypes.c_uint32),('query_flags',ctypes.c_uint32),('attach_flags',ctypes.c_uint32),('prog_ids',ctypes.c_uint64),('prog_cnt',ctypes.c_uint32)]
+    counts=[];libc=ctypes.CDLL(None,use_errno=True)
+    fd=os.open('/sys/fs/cgroup'+group,os.O_RDONLY|os.O_DIRECTORY)
+    try:
+        for attach in (0,1): # BPF_CGROUP_INET_INGRESS / EGRESS
+            ids=(ctypes.c_uint32*64)();q=Query(fd,attach,1,0,ctypes.addressof(ids),64)
+            if libc.syscall(321,16,ctypes.byref(q),ctypes.sizeof(q))!=0 or not 0<q.prog_cnt<=64:raise RuntimeError('FIXTURE_ISOLATION_BPF_UNSUPPORTED')
+            counts.append(q.prog_cnt)
+    finally:os.close(fd)
+    return {'ingressPrograms':counts[0],'egressPrograms':counts[1]}
 
-def watchdog(pid,start,run):
-    guard();rules(run)
-    # Never accept an arbitrary group from an unvalidated caller.
-    argv=Path('/proc/'+str(pid)+'/cmdline').read_bytes().split(b'\0')
-    if identity(pid)!=start or os.getpgid(pid)!=pid or not any(item.endswith(b'/qualify-native-linux.py') for item in argv) or b'--legacy-dpkg' not in argv:
-        raise RuntimeError('Quarantine watchdog owner mismatch')
-    print('READY',flush=True)
-    time.sleep(LIMIT_SECONDS)
-    # Kill package/maintainer descendants before restoring host connectivity.
-    # The pre-existing service-UID rules continue to cover systemd children.
-    if identity(pid) in (None,start):
-        try:os.killpg(pid,signal.SIGKILL)
-        except ProcessLookupError:pass
-    remove_rules(run)
-
-def probe(port):
-    with socket.create_connection(('127.0.0.1',port),timeout=5):pass
-    codes={}
-    for family,address in [(socket.AF_INET,'1.1.1.1'),(socket.AF_INET6,'2606:4700:4700::1111')]:
+def probe(run,port):
+    # Copied verbatim for actual service ExecStartPre and dpkg pre-invoke hooks.
+    # No private checkout access, environment output or application imports.
+    if not re.fullmatch('[0-9]+',run):raise RuntimeError('FIXTURE_ISOLATION_RUN_REFUSED')
+    expected='/vmpowerfixture'+run+'.slice/'
+    rows=Path('/proc/self/cgroup').read_text().splitlines()
+    if len(rows)!=1 or not rows[0].startswith('0::'+expected):raise RuntimeError('FIXTURE_ISOLATION_MEMBERSHIP_REFUSED')
+    with socket.create_connection(('127.0.0.1',int(port)),timeout=3):pass
+    outcomes={}
+    for family,address,label in [(socket.AF_INET,'1.1.1.1','ipv4'),(socket.AF_INET6,'2606:4700:4700::1111','ipv6')]:
         with socket.socket(family,socket.SOCK_STREAM) as connection:
-            connection.settimeout(5)
+            connection.settimeout(2)
             try:connection.connect((address,443))
             except OSError as exc:
-                if exc.errno not in (errno.EACCES,errno.EPERM,errno.EHOSTUNREACH,errno.ENETUNREACH,errno.ECONNREFUSED):
-                    raise RuntimeError('Explicit package egress denial unproven') from None
-                codes['ipv4' if family==socket.AF_INET else 'ipv6']=errno.errorcode[exc.errno]
-            else:raise RuntimeError('Package quarantine allowed external connection')
-    return {'loopback':'PASS','external':'DENIED','codes':codes}
+                # These results only count alongside independently queried
+                # effective kernel filters and exact slice-policy readback.
+                if isinstance(exc,TimeoutError):outcomes[label]='FILTERED_TIMEOUT'
+                elif exc.errno in (errno.EACCES,errno.EPERM,errno.ENETUNREACH,errno.EHOSTUNREACH,errno.ECONNREFUSED):outcomes[label]=errno.errorcode[exc.errno]
+                else:raise RuntimeError('FIXTURE_ISOLATION_DENIAL_UNCLASSIFIED') from None
+            else:raise RuntimeError('FIXTURE_ISOLATION_EXTERNAL_CONNECTED')
+    return {'membership':'PASS','loopback':'PASS',**outcomes}
+
+def probe_bytes():
+    return ('import errno,json,re,socket,sys\nfrom pathlib import Path\n'+inspect.getsource(probe)+
+            '\ntry: print(json.dumps(probe(sys.argv[1],int(sys.argv[2]))))\nexcept Exception: print("FIXTURE_ISOLATION_PROBE_REFUSED",file=sys.stderr);sys.exit(1)\n').encode()
+
+def policy(port=0):
+    n=names()
+    return {SYSTEM/n['slice']:b'[Slice]\nIPAddressDeny=any\nIPAddressAllow=127.0.0.1/32 ::1/128\n',
+            DROP/'90-vmpower-fixture.conf':('[Service]\nSlice='+n['slice']+'\nExecStartPre=/usr/bin/python3 '+str(PROBE)+' '+n['run']+' '+str(port)+'\n').encode()}
+
+def journal(out):
+    data=json.loads((out/'isolation.json').read_text())
+    if data['identity']!=names() or data['state'] not in ('INTENT','READY'):raise RuntimeError('FIXTURE_ISOLATION_JOURNAL_REFUSED')
+    return data
+
+def verify(out):
+    guard();out=require_output(out);data=journal(out)
+    for target,raw in policy(data.get('port',0)).items():
+        if target.is_symlink() or target.read_bytes()!=raw:raise RuntimeError('FIXTURE_ISOLATION_POLICY_DRIFT')
+    # Check the loaded policy as well as exact runtime files.
+    deny=commands.run('systemctl','show',names()['slice'],'--property=IPAddressDeny','--value').stdout.strip()
+    allow=commands.run('systemctl','show',names()['slice'],'--property=IPAddressAllow','--value').stdout.strip()
+    if set(deny.split())!={'0.0.0.0/0','::/0'} or set(allow.split())!={'127.0.0.1/32','::1/128'}:raise RuntimeError('FIXTURE_ISOLATION_LOADED_POLICY_REFUSED')
+    return effective_filters(member(os.getpid()))
+
+def prepare_service(out,port):
+    verify(out);data=journal(out)
+    if not isinstance(port,int) or not 0<port<65536:raise ValueError('FIXTURE_ISOLATION_PORT_REFUSED')
+    if data.get('port') not in (None,port):raise RuntimeError('FIXTURE_ISOLATION_PORT_DRIFT')
+    data['port']=port;commands.atomic(out/'isolation.json',data)
+    target=DROP/'90-vmpower-fixture.conf';target.write_bytes(policy(port)[target]);target.chmod(0o644)
+    PROBE.write_bytes(probe_bytes());PROBE.chmod(0o644)
+    commands.run('systemctl','daemon-reload');verify(out)
 
 def begin(native,out,port):
-    guard();run=os.environ['GITHUB_RUN_ID'];expected=rules(run)
-    owned=json.loads((out/'owned.json').read_text())
-    if 'packageQuarantine' in owned:raise RuntimeError('Package quarantine already journaled')
-    for binary,*args in expected:
-        if command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode!=1:
-            raise RuntimeError('Package quarantine rule already exists')
-    # The watchdog may kill this group, never the workflow shell/runner group.
-    if os.getpgrp()!=os.getpid():os.setsid()
-    if os.getpgrp()!=os.getpid():raise RuntimeError('Private qualifier process group required')
-    parent=os.getpid();start=identity(parent)
-    watcher=subprocess.Popen([sys.executable,str(SELF),'--watchdog',str(parent),start,run],start_new_session=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
-    owned['packageQuarantine']={'run':run,'watchdogPid':watcher.pid,'watchdogStart':identity(watcher.pid),'seconds':LIMIT_SECONDS}
-    native.write(out/'owned.json',owned)
-    ready,_,_=select.select([watcher.stdout],[],[],5)
-    if not ready or watcher.stdout.readline()!=b'READY\n':raise RuntimeError('Package quarantine watchdog did not become ready')
-    watcher.stdout.close()
-    # Journal intent before each rule; normal cleanup reconciles partial setup.
-    for binary,*args in expected:
-        owned['firewall'].append([binary,*args]);native.write(out/'owned.json',owned)
-        command(binary,'-w','-I','OUTPUT','1',*args)
-        command(binary,'-w','-C','OUTPUT',*args)
-    root=probe(port)
-    # The checkout can be below private runner ancestors. Pass only this fixed,
-    # public probe source; do not widen those ancestors for the service account.
-    probe_source='import errno,json,socket\n'+inspect.getsource(probe)+'\nprint(json.dumps(probe('+str(int(port))+')))'
-    service=json.loads(command('runuser','-u','vmpower','--',sys.executable,'-c',probe_source).stdout)
-    counters=command('iptables','-w','-L','OUTPUT','-n','-v','-x').stdout.splitlines()
-    if not any('VMPOWER_PACKAGE_'+run in row.split() and int(row.split()[0])>=2 for row in counters):
-        raise RuntimeError('Root and service quarantine packet counters unproven')
-    if watcher.poll() is not None:raise RuntimeError('Package quarantine watchdog unavailable')
-    return {'status':'PASS','scope':'all identities and protocols, nonloopback IPv4/IPv6','root':root,'service':service,'ipv4RejectPacketsAtLeastTwo':True,'ipv6RuleInstalled':True,'deadlineSeconds':LIMIT_SECONDS}
+    filters=verify(out);root=probe(names()['run'],port)
+    descendant=commands.run(sys.executable,str(PROBE),names()['run'],str(port),on_spawn=lambda pid:member(pid))
+    return {'status':'PASS','scope':'owned qualifier/package-hook/service cgroups only','kernelFilters':filters,
+            'root':root,'rootDescendant':json.loads(descendant.stdout),'serviceExecStartPre':'required on every start',
+            'hostFirewallChanged':False,'runnerControlOutsideSlice':True}
 
-def finish(owned):
-    value=owned.get('packageQuarantine')
-    if value is None:return
-    guard()
-    if value['run']!=os.environ['GITHUB_RUN_ID'] or value['seconds']!=LIMIT_SECONDS:raise RuntimeError('Package quarantine journal mismatch')
-    remove_rules(value['run'])
-    pid=value['watchdogPid']
-    if identity(pid)==value['watchdogStart']:
-        argv=Path('/proc/'+str(pid)+'/cmdline').read_bytes().split(b'\0')
-        if str(SELF).encode() not in argv or b'--watchdog' not in argv:raise RuntimeError('Package quarantine watchdog mismatch')
-        os.kill(pid,signal.SIGTERM)
-        try:os.waitpid(pid,0)
-        except ChildProcessError:pass
+def package_args(out,args):
+    if Path(args[0]).name=='dpkg' and any(a in args for a in ('--install','--remove','--purge')):
+        verify(out);data=journal(out)
+        if not data.get('port') or PROBE.read_bytes()!=probe_bytes():raise RuntimeError('FIXTURE_ISOLATION_HOOK_GUARD_REFUSED')
+        hook='/usr/bin/python3 '+str(PROBE)+' '+names()['run']+' '+str(data['port'])
+        return (args[0],'--pre-invoke='+hook,*args[1:])
+    return args
+
+@contextmanager
+def cleanup_receiver(out):
+    # The old receiver died with the previous scope. Cleanup pre-invoke hooks
+    # still require a positive fixture-only loopback control, not the application.
+    data=journal(out);port=data.get('port')
+    if not port:yield;return
+    stopped=threading.Event()
+    with socket.socket() as server:
+        server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        server.bind(('127.0.0.1',port));server.listen();server.settimeout(.1)
+        def receive():
+            while not stopped.is_set():
+                try:connection,_=server.accept();connection.close()
+                except socket.timeout:continue
+        worker=threading.Thread(target=receive,daemon=True);worker.start()
+        try:yield
+        finally:
+            stopped.set();worker.join(1)
+            if worker.is_alive():raise RuntimeError('FIXTURE_ISOLATION_RECEIVER_REMAINS')
+
+def stop_scope(unit):
+    if unit not in (names()['qualify'],names()['cleanup']):raise RuntimeError('FIXTURE_ISOLATION_SCOPE_REFUSED')
+    commands.run('systemctl','stop',unit,allowed=(0,5),timeout=15)
+    require_empty(unit)
+
+def require_empty(unit):
+    if unit not in (names()['qualify'],names()['cleanup'],'vmpower.service'):raise RuntimeError('FIXTURE_ISOLATION_SCOPE_REFUSED')
+    group=Path('/sys/fs/cgroup')/names()['slice']/unit
+    if group.exists() and any(p.read_text().strip() for p in group.rglob('cgroup.procs')):raise RuntimeError('FIXTURE_ISOLATION_DESCENDANTS_REMAIN')
+
+def supervise(out,cleanup_only=False,legacy=False):
+    guard();out=require_output(out);n=names();record=out/'isolation.json';commands.EVIDENCE=out/'evidence'
+    commands.OPERATION_FILE='operation-supervisor-linux.json'
+    # The runner/control supervisor must never enter the fixture slice itself.
+    if any(row.startswith('0::/'+n['slice']) for row in Path('/proc/self/cgroup').read_text().splitlines()):raise RuntimeError('FIXTURE_ISOLATION_SUPERVISOR_INSIDE')
+    if cleanup_only and not record.exists():return {'status':'NO_ISOLATION_JOURNAL'}
+    if record.exists():
+        saved=json.loads(record.read_text())
+        if saved.get('identity')!=n:raise RuntimeError('FIXTURE_ISOLATION_JOURNAL_REFUSED')
+        if saved.get('state')=='REMOVED':return {'status':'ALREADY_REMOVED'}
+    result={'status':'FAIL','qualifierScopeEmpty':False,'cleanupScopeEmpty':False,'isolationRemoved':False};error=None
+    def scope(mode):
+        args=['systemd-run','--scope','--quiet','--unit='+n[mode],'--slice='+n['slice'],
+              '--property=TimeoutStopSec=5s','--',sys.executable,str(ROOT/'scripts/qualify-native-linux.py'),
+              '--inside-slice','--output',str(out)]
+        if mode=='cleanup':args.append('--cleanup')
+        elif legacy:args.append('--legacy-dpkg')
+        return commands.run(*args,timeout=750)
+    try:
+        if not cleanup_only:
+            if record.exists() or DROP.exists() or any(p.exists() for p in policy()):raise RuntimeError('FIXTURE_ISOLATION_OCCUPIED')
+            if commands.run('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()!='not-found':raise RuntimeError('FIXTURE_ISOLATION_SERVICE_OCCUPIED')
+            commands.atomic(record,{'identity':n,'state':'INTENT'})
+            DROP.mkdir(mode=0o755)
+            for target,raw in policy().items():target.write_bytes(raw);target.chmod(0o644)
+            commands.run('systemctl','daemon-reload')
+            commands.atomic(record,{'identity':n,'state':'READY'})
+            try:scope('qualify')
+            except BaseException as exc:error=exc
+        # Previous cancellation can leave root dpkg/hooks. Stop and reap the
+        # entire owned scope before any fresh cleanup hooks, never kill by name.
+        stop_scope(n['qualify']);result['qualifierScopeEmpty']=True
+        if (out/'owned.json').exists():
+            commands.atomic(out/'evidence/cleanup-linux.json',{'status':'RUNNING','resourceAbsence':'Unknown'})
+            try:scope('cleanup')
+            except BaseException as exc:
+                # Keep the inner, more specific DPKG/lock/hook failure if it
+                # finalized. Otherwise persist the outer interruption category.
+                receipt=out/'evidence/cleanup-linux.json'
+                if json.loads(receipt.read_text()).get('status')!='FAIL':
+                    commands.atomic(receipt,{'status':'FAIL','resourceAbsence':'Unknown',
+                        'failure':exc.record if isinstance(exc,commands.CommandFailure) else {'classification':'CLEANUP_SCOPE_INTERRUPTED_OR_REFUSED'}})
+                raise
+            finally:stop_scope(n['cleanup'])
+        else:
+            # Qualifier journals intent before any app/account/package mutation.
+            # Unsupported BPF can therefore safely remove only its owned policy.
+            if commands.run('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()!='not-found':raise RuntimeError('FIXTURE_ISOLATION_UNJOURNALED_SERVICE')
+            commands.atomic(out/'evidence/cleanup-linux.json',{'status':'PASS','serviceAbsent':True,'childrenAbsent':True,'noOwnedResources':True})
+        result['cleanupScopeEmpty']=True
+        cleaned=json.loads((out/'evidence/cleanup-linux.json').read_text())
+        if cleaned.get('status')!='PASS':raise RuntimeError('FIXTURE_ISOLATION_CLEANUP_INCOMPLETE')
+        lifecycle=out/'evidence/lifecycle-linux.json'
+        if lifecycle.exists():
+            accepted=json.loads(lifecycle.read_text());accepted['cleanup']=cleaned
+            commands.atomic(lifecycle,accepted)
+        data=journal(out)
+        for target,raw in policy(data.get('port',0)).items():
+            if not target.exists() and data['state']=='INTENT':continue
+            if target.is_symlink() or target.read_bytes()!=raw:raise RuntimeError('FIXTURE_ISOLATION_POLICY_DRIFT')
+            target.unlink()
+        if DROP.exists():DROP.rmdir()
+        commands.run('systemctl','daemon-reload');commands.run('systemctl','stop',n['slice'],allowed=(0,5))
+        result.update(status='PASS',isolationRemoved=True);commands.atomic(record,{'identity':n,'state':'REMOVED'})
+    finally:
+        commands.atomic(out/'evidence/isolation-linux.json',result)
+        receipt=out/'evidence/cleanup-linux.json'
+        # Includes setup/preflight interruption and failure to reap before purge.
+        # SIGKILL/runner loss cannot execute finally; the always step retries.
+        if result['status']!='PASS' and not receipt.exists():
+            commands.atomic(receipt,{'status':'FAIL','resourceAbsence':'Unknown','failure':{'classification':'CLEANUP_NOT_COMPLETED'}})
+    if error:raise error
+    return result
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--watchdog',nargs=3);parser.add_argument('--probe',type=int);args=parser.parse_args()
-    if args.watchdog:watchdog(int(args.watchdog[0]),args.watchdog[1],args.watchdog[2])
-    elif args.probe:print(json.dumps(probe(args.probe)))
-    else:parser.error('Explicit fixture mode required')
+    parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);parser.add_argument('--cleanup',action='store_true');parser.add_argument('--legacy-dpkg',action='store_true');args=parser.parse_args()
+    try:
+        commands.handle_signals()
+        supervise(args.output,args.cleanup,args.legacy_dpkg)
+    except BaseException as exc:
+        print(json.dumps({'status':'FAIL','classification':exc.record['classification'] if isinstance(exc,commands.CommandFailure) else 'ISOLATION_OR_INTERRUPTION_REFUSED'}));sys.exit(1)

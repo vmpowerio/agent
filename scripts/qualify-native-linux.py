@@ -2,6 +2,7 @@
 """Real systemd lifecycle on an otherwise empty ephemeral Ubuntu runner only."""
 import argparse,hashlib,importlib.util,json,os,platform,pwd,grp,shlex,shutil,signal,stat,subprocess,sys,tempfile,time
 from pathlib import Path
+import native_linux_commands as bounded
 sys.dont_write_bytecode=True
 from native_fixture_paths import require_output
 ROOT=Path(__file__).resolve().parents[1]
@@ -10,6 +11,15 @@ MANAGED=[Path('/opt/vmpower-agent'),Path('/etc/vmpower.conf'),Path('/etc/systemd
 FIXED_ANCESTORS=('/', '/opt', '/etc', '/etc/systemd', '/etc/systemd/system', '/usr', '/usr/bin')
 OPT_PATH=Path('/opt')
 OPT_CHANGE={'path':'/opt','uid':0,'gid':0,'originalMode':'0777','temporaryMode':'0755'}
+ACTIVE_OUTPUT=None
+def isolation():return package_fixture().quarantine()
+class Phases(list):
+    def __init__(self,out,lane):
+        super().__init__();self.out=out;self.lane=lane
+        write(out/'evidence/progress-linux.json',{'lane':lane,'state':'STARTED','completed':[]})
+    def append(self,value):
+        super().append(value)
+        write(self.out/'evidence/progress-linux.json',{'lane':self.lane,'state':'PROGRESS','completed':list(self)})
 def package_fixture():
     spec=importlib.util.spec_from_file_location('linux_dpkg_fixture',ROOT/'scripts/qualify-linux-dpkg.py')
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
@@ -65,9 +75,11 @@ def complete_cleanup(out,owned,result):
     write(out/'evidence/cleanup-linux.json',result)
     return result
 def command(*args,allowed=(0,),**kwargs):
-    result=subprocess.run(args,capture_output=True,text=True,timeout=35,**kwargs)
-    if result.returncode not in allowed:raise RuntimeError('Native command failed: '+str(args[0])+' returncode='+str(result.returncode))
-    return result
+    if ACTIVE_OUTPUT:
+        args=isolation().package_args(ACTIVE_OUTPUT,args)
+        if Path(args[0]).name=='dpkg' and any(a in args for a in ('--install','--remove','--purge')):
+            kwargs['on_spawn']=lambda pid:isolation().member(pid)
+    return bounded.run(*args,allowed=allowed,**kwargs)
 def service_fixture(source,expected,probe,destination):
     """Copy public fixture bytes out of runner-private ancestors; no service action."""
     spec=importlib.util.spec_from_file_location('fixture_installer',ROOT/'scripts/install-linux-bundle.py')
@@ -118,12 +130,19 @@ def mainpid():return int(command('systemctl','show','vmpower.service','--propert
 def child(expected):
     pid=mainpid()
     if pid<2 or os.readlink('/proc/'+str(pid)+'/exe')!=str(expected):raise RuntimeError('Wrong service child')
+    if ACTIVE_OUTPUT:
+        guard_scope=isolation();guard_scope.verify(ACTIVE_OUTPUT)
+        guard_scope.effective_filters(guard_scope.member(pid,'vmpower.service'))
+        pre=command('systemctl','show','vmpower.service','--property=ExecStartPre','--value').stdout
+        # Actual systemd-executed guard, not a probe run as another service user.
+        if str(guard_scope.PROBE) not in pre or 'code=exited' not in pre or 'status=0' not in pre:
+            raise RuntimeError('FIXTURE_ISOLATION_SERVICE_PRESTART_UNPROVEN')
     return pid
 def dead(pid):return not Path('/proc/'+str(pid)).exists()
 def receiver_matches(out,executable,argv):
     node=str(out/'bundle/runtime/node')
     return executable==node and argv==[node.encode(),str(ROOT/'scripts/native-report-fixture.cjs').encode(),b'']
-def cleanup(out):
+def cleanup_owned(out):
     guard();out=require_output(out);journal=out/'owned.json'
     if not journal.exists():return {'status':'NO_OWNED_RESOURCES'}
     owned=json.loads(journal.read_text())
@@ -135,6 +154,7 @@ def cleanup(out):
     if owned['run']!=os.environ['GITHUB_RUN_ID'] or owned['paths']!=[str(p) for p in managed]:raise RuntimeError('Cleanup ownership mismatch')
     validate_opt_journal(owned)
     command('systemctl','stop','vmpower.service',allowed=(0,5))
+    if ACTIVE_OUTPUT:isolation().require_empty('vmpower.service')
     command('systemctl','disable','vmpower.service',allowed=(0,1))
     survivors=[]
     for process in Path('/proc').iterdir():
@@ -151,15 +171,11 @@ def cleanup(out):
                 os.kill(pid,signal.SIGTERM)
             else:raise RuntimeError('RECEIVER_IDENTITY_MISMATCH')
         except (FileNotFoundError,ProcessLookupError):pass
-    # Keep whole-runner quarantine through the final actual package hook.
+    # All package cleanup hooks remain in the isolated cleanup scope.
     if dpkg:
         if dpkg.package_state(sys.modules[__name__])!='absent':command('dpkg','--purge',dpkg.PACKAGE)
         dpkg.require_absent(sys.modules[__name__])
-    for rule in owned.get('firewall',[]):
-        binary,args=rule[0],rule[1:]
-        if command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode==0:command(binary,'-w','-D','OUTPUT',*args)
-        assert command(binary,'-w','-C','OUTPUT',*args,allowed=(0,1)).returncode==1
-    if dpkg:dpkg.quarantine().finish(owned)
+    if owned.get('firewall'):raise RuntimeError('Historical firewall journal requires separate reconciliation')
     for path in managed:
         if path.is_dir():shutil.rmtree(path)
         elif path.exists() or path.is_symlink():path.unlink()
@@ -175,7 +191,7 @@ def cleanup(out):
     assert all(not p.exists() for p in managed)
     assert command('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()=='not-found'
     for path in out.iterdir():
-        if path.name in ['evidence','owned.json']:continue
+        if path.name in ['evidence','owned.json','isolation.json']:continue
         if path.is_dir():shutil.rmtree(path)
         else:path.unlink()
     result={'status':'FAIL' if survivors else 'PASS','serviceAbsent':True,'childrenAbsent':not survivors,'managedFilesAbsent':True,'fixtureInputsRemoved':True,'firewallRulesRemoved':True,'receiverStopped':True}
@@ -183,6 +199,28 @@ def cleanup(out):
     write(out/'evidence/cleanup-linux.json',result)
     if survivors:raise RuntimeError('Service left children; forced cleanup performed')
     return complete_cleanup(out,owned,result)
+def cleanup(out):
+    # Validate the destination before creating any receipt. Foreign paths/journals
+    # never become writable merely because this is an always-cleanup invocation.
+    guard();out=require_output(out)
+    if (out/'owned.json').exists():
+        owned=json.loads((out/'owned.json').read_text());managed=list(MANAGED)
+        if 'dpkgPackage' in owned:
+            fixture=package_fixture()
+            if owned['dpkgPackage']!=fixture.PACKAGE:raise RuntimeError('Package cleanup ownership mismatch')
+            managed+=fixture.EXTRA_PATHS
+        if owned['run']!=os.environ['GITHUB_RUN_ID'] or owned['paths']!=[str(p) for p in managed]:raise RuntimeError('Cleanup ownership mismatch')
+    result={'status':'FAIL','resourceAbsence':'Unknown'}
+    try:
+        if not (out/'owned.json').exists():
+            result={'status':'PASS','serviceAbsent':True,'childrenAbsent':True,'noOwnedResources':True}
+            return result
+        result=cleanup_owned(out)
+        return result
+    except BaseException as exc:
+        result['failure']=exc.record if isinstance(exc,bounded.CommandFailure) else {'classification':'CLEANUP_REFUSED'}
+        raise
+    finally:write(out/'evidence/cleanup-linux.json',result)
 def qualify(out,legacy_dpkg=False):
     guard()
     out=require_output(out)
@@ -202,7 +240,7 @@ def qualify(out,legacy_dpkg=False):
     if dpkg:owned['dpkgPackage']=dpkg.PACKAGE
     write(out/'owned.json',owned)
     prepared=json.loads((out/'evidence/prepared.json').read_text());hashes=prepared['bundles'];node=SERVICE_FIXTURE/'bundle/runtime/node'
-    phases=[];result={'status':'FAIL','head':prepared['head'],'platform':platform.platform(),'image':os.environ.get('ImageOS'),'imageVersion':os.environ.get('ImageVersion'),'architecture':platform.machine(),'libc':platform.libc_ver(),'phases':phases,'customerOSCompatibility':'Unknown'}
+    phases=Phases(out,'lifecycle');result={'status':'FAIL','head':prepared['head'],'platform':platform.platform(),'image':os.environ.get('ImageOS'),'imageVersion':os.environ.get('ImageVersion'),'architecture':platform.machine(),'libc':platform.libc_ver(),'phases':phases,'customerOSCompatibility':'Unknown'}
     try:
         spec=importlib.util.spec_from_file_location('installer',ROOT/'scripts/install-linux-bundle.py');installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
         result['fixedAncestorMetadata']=fixed_ancestor_metadata()
@@ -210,18 +248,17 @@ def qualify(out,legacy_dpkg=False):
         installer.System().destination(SERVICE_FIXTURE)
         result['serviceFixture']=service_fixture(out/'bundle',hashes['bundle'],ROOT/'scripts/native-egress-probe.cjs',SERVICE_FIXTURE)
         command('useradd','--system','--user-group','--no-create-home','--home-dir','/nonexistent','--shell','/usr/sbin/nologin','vmpower')
-        uid=pwd.getpwnam('vmpower').pw_uid
-        for binary,address in [('iptables','127.0.0.1/32'),('ip6tables','::1/128')]:
-            args=['-m','owner','--uid-owner',str(uid),'!','-d',address,'-m','comment','--comment','VMPOWER_NATIVE_FIXTURE','-j','REJECT']
-            owned['firewall'].append([binary,*args]);write(out/'owned.json',owned)
-            command(binary,'-w','-I','OUTPUT','1',*args)
+        guard_scope=isolation();result['kernelIsolation']=guard_scope.verify(out)
         receiver=subprocess.Popen([str(out/'bundle/runtime/node'),str(ROOT/'scripts/native-report-fixture.cjs')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         owned['receiverPid']=receiver.pid;write(out/'owned.json',owned)
+        guard_scope.member(receiver.pid)
         port=wait(lambda:state(out)['port'])
-        proof=egress_probe(node,SERVICE_FIXTURE/'native-egress-probe.cjs',port)
-        counters=command('iptables','-w','-L','OUTPUT','-n','-v','-x').stdout.splitlines()
-        assert any('VMPOWER_NATIVE_FIXTURE' in row and int(row.split()[0])>0 for row in counters)
-        phases.append({'phase':'outbound-denial','status':'PASS','probe':json.loads(proof.stdout),'ipv4RulePacketsPositive':True,'ipv6RuleInstalled':True})
+        guard_scope.prepare_service(out,port)
+        root_proof=guard_scope.begin(sys.modules[__name__],out,port)
+        proof=command('runuser','-u','vmpower','--','/usr/bin/python3',str(guard_scope.PROBE),guard_scope.names()['run'],str(port))
+        phases.append({'phase':'outbound-denial','status':'PASS','rootAndDescendant':root_proof,'serviceUser':json.loads(proof.stdout),'hostFirewallChanged':False})
+        smoke=command(str(out/'bundle/runtime/node'),str(ROOT/'scripts/native-bundle-smoke.cjs'))
+        result['nativeBundleSmoke']=json.loads(smoke.stdout)
         no_config=command('runuser','-u','vmpower','--',str(node),str(SERVICE_FIXTURE/'bundle/app/index.js'),allowed=(1,))
         assert 'required option' in no_config.stderr
         phases.append({'phase':'real-cli-no-config','status':'PASS'})
@@ -274,12 +311,22 @@ def qualify(out,legacy_dpkg=False):
             result['realPackageOwnership']={'status':'FAIL','families':[],'packages':{}}
             dpkg.qualify(sys.modules[__name__],out,installer,hashes,result['realPackageOwnership'])
         result['status']='PASS'
+    except BaseException as exc:
+        result['failure']=exc.record if isinstance(exc,bounded.CommandFailure) else {'classification':'LIFECYCLE_REFUSED_OR_INTERRUPTED'}
+        raise
     finally:
-        try:result['cleanup']=cleanup(out)
-        except Exception:result['status']='FAIL';result['cleanup']={'status':'FAIL'};raise
-        finally:write(out/'evidence/lifecycle-linux.json',result)
-    print(json.dumps({'nativeLifecycle':'PASS','phases':len(phases),'cleanup':result['cleanup']['status']}))
+        result['cleanup']={'status':'PENDING_OUTER_SCOPE_RECONCILIATION'}
+        write(out/'evidence/lifecycle-linux.json',result)
+    print(json.dumps({'nativeLifecycle':'PASS','phases':len(phases),'cleanup':'PENDING'}))
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);parser.add_argument('--cleanup',action='store_true');parser.add_argument('--legacy-dpkg',action='store_true');args=parser.parse_args();guard()
-    if args.cleanup:cleanup(args.output)
-    else:qualify(args.output,args.legacy_dpkg)
+    parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);parser.add_argument('--cleanup',action='store_true');parser.add_argument('--legacy-dpkg',action='store_true');parser.add_argument('--inside-slice',action='store_true');args=parser.parse_args()
+    try:
+        bounded.handle_signals()
+        guard();ACTIVE_OUTPUT=require_output(args.output);bounded.EVIDENCE=ACTIVE_OUTPUT/'evidence'
+        if not args.inside_slice:raise RuntimeError('FIXTURE_ISOLATION_SUPERVISOR_REQUIRED')
+        isolation().verify(ACTIVE_OUTPUT)
+        if args.cleanup:
+            with isolation().cleanup_receiver(ACTIVE_OUTPUT):cleanup(ACTIVE_OUTPUT)
+        else:qualify(ACTIVE_OUTPUT,args.legacy_dpkg)
+    except BaseException as exc:
+        print(json.dumps({'status':'FAIL','classification':exc.record['classification'] if isinstance(exc,bounded.CommandFailure) else 'NATIVE_REFUSED_OR_INTERRUPTED'}));sys.exit(1)

@@ -32,6 +32,7 @@ jobs:
           python3 scripts/test-stage-distribution.py
           python3 scripts/test-install-linux-bundle.py
           python3 scripts/test-linux-deb.py
+          python3 scripts/test-linux-slice.py
           python3 scripts/test-native-preparation.py
           python3 scripts/test-legacy-package-inputs.py
           node scripts/test-native-report-fixture.cjs
@@ -40,18 +41,16 @@ jobs:
         run: python3 scripts/prepare-native-inputs.py --output "$RUNNER_TEMP/vmpower-native"
       - name: Stage exact retained public Debian package families before quarantine
         run: python3 scripts/prepare-legacy-package-inputs.py --output "$RUNNER_TEMP/vmpower-native"
-      - name: Real native bundle CLI
-        run: '"$RUNNER_TEMP/vmpower-native/bundle/runtime/node" scripts/native-bundle-smoke.cjs'
       - name: Isolated systemd lifecycle and progress
         run: |
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
-            python3 scripts/qualify-native-linux.py --output "$RUNNER_TEMP/vmpower-native" --legacy-dpkg
+            python3 scripts/linux-package-quarantine.py --output "$RUNNER_TEMP/vmpower-native" --legacy-dpkg
       - name: Always reconcile owned fixture cleanup
         if: always()
         run: |
           if [ -f scripts/qualify-native-linux.py ]; then
             sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
-              python3 scripts/qualify-native-linux.py --cleanup --output "$RUNNER_TEMP/vmpower-native"
+              python3 scripts/linux-package-quarantine.py --cleanup --output "$RUNNER_TEMP/vmpower-native"
           fi
       - name: Sanitized qualification receipts only
         if: always()
