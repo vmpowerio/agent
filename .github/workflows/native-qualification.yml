@@ -2,7 +2,7 @@ name: Agent native qualification
 
 on:
   push:
-    branches: [master, security/agent-node24-delivery-20261025]
+    branches: [master, security/agent-node24-delivery-20261025, security/agent-package-ownership-20261026]
   pull_request:
     branches: [master]
 
@@ -31,23 +31,26 @@ jobs:
           npm run build
           python3 scripts/test-stage-distribution.py
           python3 scripts/test-install-linux-bundle.py
+          python3 scripts/test-linux-deb.py
+          python3 scripts/test-linux-slice.py
           python3 scripts/test-native-preparation.py
+          python3 scripts/test-legacy-package-inputs.py
           node scripts/test-native-report-fixture.cjs
           node scripts/test-native-fixture-paths.cjs
       - name: Stage pinned official runtime and labeled fixtures
         run: python3 scripts/prepare-native-inputs.py --output "$RUNNER_TEMP/vmpower-native"
-      - name: Real native bundle CLI
-        run: '"$RUNNER_TEMP/vmpower-native/bundle/runtime/node" scripts/native-bundle-smoke.cjs'
+      - name: Stage exact retained public Debian package families before quarantine
+        run: python3 scripts/prepare-legacy-package-inputs.py --output "$RUNNER_TEMP/vmpower-native"
       - name: Isolated systemd lifecycle and progress
         run: |
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
-            python3 scripts/qualify-native-linux.py --output "$RUNNER_TEMP/vmpower-native"
+            python3 scripts/linux-package-quarantine.py --output "$RUNNER_TEMP/vmpower-native" --legacy-dpkg
       - name: Always reconcile owned fixture cleanup
         if: always()
         run: |
           if [ -f scripts/qualify-native-linux.py ]; then
             sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,ImageOS,ImageVersion,RUNNER_TEMP \
-              python3 scripts/qualify-native-linux.py --cleanup --output "$RUNNER_TEMP/vmpower-native"
+              python3 scripts/linux-package-quarantine.py --cleanup --output "$RUNNER_TEMP/vmpower-native"
           fi
       - name: Sanitized qualification receipts only
         if: always()
@@ -73,6 +76,18 @@ jobs:
         with:
           node-version: 24.22.1
           registry-url: https://registry.npmjs.org
+      - name: Parse PowerShell and verify admitted existing Chocolatey
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach ($file in (Get-ChildItem scripts,packages/win32/node24/tools -Filter '*.ps1' -Recurse -File)) {
+            $tokens=$null;$parseErrors=$null
+            $null=[System.Management.Automation.Language.Parser]::ParseFile($file.FullName,[ref]$tokens,[ref]$parseErrors)
+            if ($parseErrors.Count -ne 0) { throw ('PowerShell parse failed: '+$file.Name) }
+          }
+          # Official runner-images Windows2025 image 20261021.299.1, read 2026-10-26.
+          $chocolateyVersion=& (Join-Path $env:ChocolateyInstall 'bin\choco.exe') --version
+          if ($LASTEXITCODE -ne 0 -or ([string]$chocolateyVersion).Trim() -cne '2.7.4') { throw 'Existing Chocolatey differs from admitted 2.7.4; no installation or update allowed' }
+          & scripts/test-windows-package-cleanup.ps1
       - name: Install exact public lock and compile
         run: |
           npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
@@ -83,6 +98,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/test-native-preparation.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-build-windows-package.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-legacy-package-inputs.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/test-native-report-fixture.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/test-native-fixture-paths.cjs
@@ -92,6 +111,8 @@ jobs:
           & scripts/test-windows-bootstrap.ps1
           python scripts/prepare-native-inputs.py --output "$env:RUNNER_TEMP\vmpower-native"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/prepare-legacy-package-inputs.py --output "$env:RUNNER_TEMP\vmpower-native"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Real native bundle CLI and installer argv ACL controls
         run: |
           $root=Join-Path $env:RUNNER_TEMP 'vmpower-native'
@@ -100,7 +121,7 @@ jobs:
           $prepared=Get-Content -Raw "$root\evidence\prepared.json" | ConvertFrom-Json
           & scripts/test-install-windows-bundle.ps1 -Bundle "$root\bundle" -ExpectedManifestSha256 $prepared.bundles.bundle -NssmExe "$root\nssm.exe"
       - name: Isolated NSSM lifecycle and progress
-        run: '& scripts/qualify-native-windows.ps1 -Output "$env:RUNNER_TEMP\vmpower-native"'
+        run: '& scripts/qualify-native-windows.ps1 -Output "$env:RUNNER_TEMP\vmpower-native" -LegacyPackages "$env:RUNNER_TEMP\vmpower-native\legacy-packages" -ChocolateyVersion 2.7.4'
       - name: Always reconcile owned fixture cleanup
         if: always()
         run: |

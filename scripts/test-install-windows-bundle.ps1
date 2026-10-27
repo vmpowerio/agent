@@ -39,6 +39,55 @@ function Invoke-CheckedNative([string]$Exe,[string[]]$Arguments) {
     if ($Arguments[0] -eq 'start' -and $script:failStart) { $script:failStart=$false;throw 'Synthetic startup failure' }
     return ''
 }
+function Test-FinalizationRollback([string]$Kind) {
+    # Run the actual installer transaction; substitute only SCM/NSSM operations.
+    # A post-activation callback must restore state, not merely preserve a file.
+    $script:transactionState=@{ImagePath='"C:\prior wrapper\nssm.exe"';Active=($Kind -ne 'denied');
+        Start=$(if ($Kind -eq 'denied') {'SERVICE_DISABLED'} else {'SERVICE_DEMAND_START'});
+        Application='C:\prior runtime\node.exe';AppDirectory='C:\prior runtime';AppParameters='"prior app.js"'}
+    $expectedState=$script:transactionState.Clone()
+    function Get-ServiceSnapshot { return $script:transactionState.Clone() }
+    function Get-Service { return @{Status=$(if ($script:transactionState.Active) {'Running'} else {'Stopped'})} }
+    function Start-Service { $script:transactionState.Active=$true }
+    function Wait-StableServiceChild { }
+    function Invoke-CheckedNative([string]$Exe,[string[]]$Arguments) {
+        if ($Exe -eq 'sc.exe') { $script:transactionState.ImagePath=$Arguments[3] }
+        elseif ($Arguments[0] -eq 'set') { $script:transactionState[$Arguments[2]]=$Arguments[3] }
+        elseif ($Arguments[0] -eq 'stop') { $script:transactionState.Active=$false }
+        elseif ($Arguments[0] -eq 'start') { $script:transactionState.Active=$true }
+        else { throw 'Unexpected native operation in finalization control' }
+        return ''
+    }
+    $sentinel=Join-Path $temporary ('finalization-'+$Kind+'.exe')
+    [IO.File]::WriteAllText($sentinel,'retained shim')
+    $lock=$null;$script:finalizationCallbackReached=$false;$failed=$false
+    try {
+        if ($Kind -eq 'locked') { $lock=[IO.File]::Open($sentinel,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read) }
+        try {
+            $null=Install-AgentBundle $Bundle $ExpectedManifestSha256 $NssmExe $null {
+                Assert-True ($script:transactionState.Application -ne $expectedState.Application) 'Callback did not run after new runtime activation'
+                $script:finalizationCallbackReached=$true
+                if ($Kind -eq 'changed') {
+                    [IO.File]::WriteAllText($sentinel,'replacement owned by another actor')
+                    throw 'Synthetic changed shim refusal'
+                }
+                if ($Kind -eq 'denied') { throw (New-Object UnauthorizedAccessException 'Synthetic shim deletion denial') }
+                if ($Kind -eq 'marker') { throw (New-Object IO.IOException 'Synthetic marker restoration failure') }
+                Remove-Item -LiteralPath $sentinel -Force -ErrorAction Stop
+            }
+        } catch { $failed=$true }
+        Assert-True ($failed -and $script:finalizationCallbackReached) 'Post-activation failure control did not reach rollback'
+        foreach ($setting in $expectedState.Keys) {
+            Assert-True ($script:transactionState[$setting] -ceq $expectedState[$setting]) ('Finalization failed to restore '+$setting)
+        }
+        Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($config)) -eq [Convert]::ToBase64String($before)) 'Finalization failure changed configuration'
+        Assert-True (Test-Path -LiteralPath $sentinel) 'Finalization compensation deleted shim'
+        if ($Kind -eq 'changed') { Assert-True ([IO.File]::ReadAllText($sentinel) -ceq 'replacement owned by another actor') 'Compensation overwrote unrelated replacement' }
+    } finally {
+        if ($lock) { $lock.Dispose() }
+        $script:finalizationCallbackReached=$false
+    }
+}
 try {
     $null=New-Item -ItemType Directory -Path $temporary
     $null=New-Item -ItemType Directory -Path (Join-Path $temporary 'Program Files'),(Join-Path $temporary 'ProgramData')
@@ -74,10 +123,10 @@ try {
     $null=New-Item -ItemType HardLink -Path $hardlink -Target $config
     Assert-Throws { Ensure-Config $config $json }
     Remove-Item -LiteralPath $hardlink
-    $script:previous=@{ImagePath='"C:\legacy wrapper\nssm.exe"';Active=$true;Application='C:\legacy agent\vmpower.exe';AppDirectory='C:\legacy agent';AppParameters='--fixture "two words"'}
+    $script:previous=@{ImagePath='"C:\legacy wrapper\nssm.exe"';Active=$true;Start='SERVICE_DEMAND_START';Application='C:\legacy agent\vmpower.exe';AppDirectory='C:\legacy agent';AppParameters='--fixture "two words"'}
     $script:failStart=$true
     Assert-Throws { Install-AgentBundle $Bundle $ExpectedManifestSha256 $NssmExe $null }
-    foreach ($setting in @('Application','AppDirectory','AppParameters')) {
+    foreach ($setting in @('Application','AppDirectory','AppParameters','Start')) {
         $restored=@($script:events | Where-Object { $_.Count -eq 5 -and $_[1] -eq 'set' -and $_[3] -eq $setting -and $_[4] -ceq $script:previous[$setting] })
         Assert-True ($restored.Count -eq 1) ('Previous '+$setting+' not restored')
     }
@@ -103,7 +152,8 @@ try {
     Assert-True (@($script:events | Where-Object { $_.Count -eq 4 -and $_[1] -eq 'remove' -and $_[2] -eq 'vmpoweragent' -and $_[3] -eq 'confirm' }).Count -eq 1) 'Uninstall did not remove the mocked service'
     Assert-True (Test-Path -LiteralPath $config) 'Uninstall removed config'
     Assert-True (Test-Path -LiteralPath $installedNode) 'Uninstall removed retained release'
-    @{status='PASS';nativeArgv='PASS';configuration='PASS';ACL='PASS';mockedServiceRollback='PASS';serviceLifecycle='NOT_TESTED'} | ConvertTo-Json
+    foreach ($fault in @('changed','locked','denied','marker')) { Test-FinalizationRollback $fault }
+    @{status='PASS';nativeArgv='PASS';configuration='PASS';ACL='PASS';mockedServiceRollback='PASS';postActivationFailureStateControls=4;serviceLifecycle='NOT_TESTED'} | ConvertTo-Json
 } finally {
     if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
 }
