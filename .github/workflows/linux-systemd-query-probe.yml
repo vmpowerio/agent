@@ -1,0 +1,21 @@
+name: Agent read-only systemd query probe
+on:
+  push:
+    branches: [diagnostics/agent-systemd-query-contract-20261027]
+    paths:
+      - .github/workflows/linux-systemd-query-probe.yml
+      - scripts/probe-systemd-query-contract.py
+permissions:
+  contents: read
+jobs:
+  read-only-query-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Query manager metadata only; never qualify a fixture
+        run: |
+          timeout --kill-after=2s 20s sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,GITHUB_SHA,ImageOS \
+            python3 -B scripts/probe-systemd-query-contract.py
