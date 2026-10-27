@@ -64,6 +64,12 @@ network. A real transport negative control verifies that namespace before
 testing. Tests additionally deny Node transports and machine agent-config
 reads; notification pipes, processes and provider calls remain synthetic.
 
+Linux native fixtures check existing manager units, unit lookup paths and cgroups
+before creating their owned slice. Do not use a named `systemctl show` query to
+prove slice absence: systemd can load an implicit slice during that query.
+Sanitized supervisor receipts distinguish the primary refusal from later cleanup;
+a successful workflow step alone does not establish resource cleanup.
+
 Drone's ordinary branch pushes, pull requests and `master` merges run only the
 modern source-validation step. Every legacy packaging and Azure publishing
 step requires both the `tag` event and a `refs/tags/v*` reference. A release tag

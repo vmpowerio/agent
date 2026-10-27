@@ -151,13 +151,83 @@ class SliceTests(unittest.TestCase):
                     def read(target,*args,**kwargs):
                         return '0::/system.slice/runner.service' if str(target)=='/proc/self/cgroup' else original_read(target,*args,**kwargs)
                     def execute(*args,**kwargs):
-                        calls.append(args);self.assertEqual(args[:2],('systemctl','show'))
-                        loaded=kind=='loaded-unit' and args[2]==isolation.names()[collision]
-                        return mock.Mock(stdout='loaded' if loaded else 'not-found')
-                    def group(key):return mock.Mock(exists=lambda:kind=='cgroup' and key==collision)
+                        calls.append(args)
+                        if args[:2]==('systemctl','list-units'):
+                            return mock.Mock(stdout=(isolation.names()[collision]+' loaded inactive dead fixture') if kind=='loaded-unit' else '')
+                        if args[:2]==('systemctl','list-unit-files'):return mock.Mock(stdout='')
+                        if args==('systemctl','show','--property=UnitPath','--value'):return mock.Mock(stdout=str(out/'units'))
+                        self.assertEqual(args[2],'vmpower.service');return mock.Mock(stdout='not-found')
+                    def group(key):return out/('cgroup-'+key)
+                    if kind=='cgroup':group(collision).mkdir()
                     with mock.patch.object(isolation,'guard'),mock.patch.object(isolation,'require_output',return_value=out),mock.patch.object(isolation,'DROP',drop),mock.patch.object(isolation,'policy',return_value={}),mock.patch.object(isolation,'unit_group',side_effect=group),mock.patch.object(Path,'read_text',autospec=True,side_effect=read),mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(commands,'EVIDENCE'),mock.patch.object(commands,'OPERATION_FILE'),mock.patch.object(isolation,'stop_scope') as stopped:
                         with self.assertRaisesRegex(RuntimeError,'UNIT_COLLISION'):isolation.supervise(out)
                     self.assertFalse((out/'isolation.json').exists());self.assertFalse(drop.exists());stopped.assert_not_called()
+                    failure=json.loads((out/'evidence/supervisor-outcome-linux.json').read_text())['failure']
+                    self.assertEqual(failure,{'phase':'UNIT_ADMISSION','resource':collision,'reason':'LOADED_UNIT' if kind=='loaded-unit' else 'CGROUP'})
+    def test_absent_implicit_slice_is_not_loaded_by_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);calls=[]
+            def execute(*args,**kwargs):
+                calls.append(args)
+                if args[1] in ('list-units','list-unit-files'):return mock.Mock(stdout='')
+                if args==('systemctl','show','--property=UnitPath','--value'):return mock.Mock(stdout=str(root/'units'))
+                # systemd255 loads optional-fragment slices during named GetAll.
+                return mock.Mock(stdout='loaded')
+            with mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(isolation,'unit_group',side_effect=lambda key:root/key):isolation.admit_units()
+            self.assertEqual(len(calls),3);self.assertIn('--all',calls[0])
+            self.assertEqual(calls[-1],('systemctl','show','--property=UnitPath','--value'))
+    def test_unloaded_files_dropins_and_dangling_masks_are_collisions(self):
+        for key in ('slice','qualify','cleanup'):
+            for kind in ('file','dropin','dangling-mask'):
+                with self.subTest(key=key,kind=kind),tempfile.TemporaryDirectory() as directory:
+                    root=Path(directory);units=root/'units';units.mkdir();target=units/isolation.names()[key]
+                    if kind=='file':target.write_text('foreign')
+                    elif kind=='dropin':Path(str(target)+'.d').mkdir()
+                    else:target.symlink_to(root/'absent')
+                    def execute(*args,**kwargs):return mock.Mock(stdout=str(units) if args[1]=='show' else '')
+                    with mock.patch.object(commands,'run',side_effect=execute),mock.patch.object(isolation,'unit_group',side_effect=lambda key:root/('cg-'+key)):
+                        with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
+                    self.assertEqual(caught.exception.reason,'DROPIN' if kind=='dropin' else 'UNIT_FILE');self.assertEqual(caught.exception.resource,key)
+    def test_memory_and_installed_enumeration_refuse_any_exact_unit(self):
+        for verb in ('list-units','list-unit-files'):
+            for state in ('loaded inactive dead','not-found inactive dead','loaded active running transient'):
+                with self.subTest(verb=verb,state=state):
+                    def execute(*args,**kwargs):return mock.Mock(stdout=isolation.names()['slice']+' '+state if args[1]==verb else '')
+                    with mock.patch.object(commands,'run',side_effect=execute):
+                        with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
+                    self.assertEqual(caught.exception.reason,'LOADED_UNIT' if verb=='list-units' else 'UNIT_FILE')
+    def test_malformed_queries_and_unreadable_metadata_fail_closed(self):
+        for raw in ('','relative/path','/safe/../other','/safe\nunsafe','/safe;unexpected'):
+            with self.subTest(raw=raw):
+                def execute(*args,**kwargs):return mock.Mock(stdout=raw if args[1]=='show' else '')
+                with mock.patch.object(commands,'run',side_effect=execute):
+                    with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
+                self.assertEqual(caught.exception.reason,'PARSE_FAILED')
+        with mock.patch.object(commands,'run',return_value=mock.Mock(stdout='unexpected sensitive text')):
+            with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.admit_units()
+        self.assertEqual(caught.exception.reason,'PARSE_FAILED');self.assertNotIn('sensitive',str(caught.exception))
+        failure=commands.CommandFailure({'operation':'SYSTEMCTL','classification':'EXIT_NONZERO'})
+        with mock.patch.object(commands,'run',side_effect=failure):
+            with self.assertRaises(commands.CommandFailure):isolation.admit_units()
+        with mock.patch.object(Path,'lstat',side_effect=PermissionError('withheld')):
+            with self.assertRaises(PermissionError):isolation.occupied(Path('/unreadable'))
+    def test_exclusive_policy_creation_preserves_raced_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target=Path(directory)/'unit';target.write_bytes(b'foreign')
+            with self.assertRaises(FileExistsError):isolation.create_policy(target,b'fixture')
+            self.assertEqual(target.read_bytes(),b'foreign')
+    def test_preflight_failure_survives_no_journal_cleanup_refusal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory);(out/'evidence').mkdir();system=out/'system';system.mkdir()
+            original_read=Path.read_text
+            def read(target,*args,**kwargs):return '0::/system.slice/runner.service' if str(target)=='/proc/self/cgroup' else original_read(target,*args,**kwargs)
+            with mock.patch.object(isolation,'guard'),mock.patch.object(isolation,'require_output',return_value=out),mock.patch.object(isolation,'SYSTEM',system),mock.patch.object(isolation,'DROP',system/'vmpower.service.d'),mock.patch.object(Path,'read_text',autospec=True,side_effect=read),mock.patch.object(isolation,'admit_units',side_effect=isolation.AdmissionRefused('LOADED_UNIT','slice')),mock.patch.object(commands,'run',return_value=mock.Mock(stdout='not-found')):
+                with self.assertRaises(isolation.AdmissionRefused):isolation.supervise(out)
+                receipt=(out/'evidence/supervisor-outcome-linux.json').read_bytes()
+                self.assertEqual(json.loads(receipt)['failure'],{'phase':'UNIT_ADMISSION','resource':'slice','reason':'LOADED_UNIT'})
+                with self.assertRaises(isolation.AdmissionRefused) as caught:isolation.supervise(out,cleanup_only=True)
+                self.assertEqual(caught.exception.reason,'NO_JOURNAL');self.assertEqual((out/'evidence/supervisor-outcome-linux.json').read_bytes(),receipt)
+                self.assertEqual(json.loads((out/'evidence/cleanup-linux.json').read_text())['status'],'FAIL')
     def test_unowned_loaded_scope_cannot_be_stopped_after_admission(self):
         data={'identity':isolation.names(),'ownershipToken':'a'*32,'unitStates':{'qualify':'CREATE_INTENT'}}
         with mock.patch.object(isolation,'journal',return_value=data),mock.patch.object(commands,'run',return_value=mock.Mock(stdout='LoadState=loaded\nDescription=foreign\nControlGroup=/vmpowerfixture12345.slice/vmpowerqualify12345.scope')) as execute:

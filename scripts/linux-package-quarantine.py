@@ -10,6 +10,22 @@ SYSTEM=Path('/run/systemd/system')
 DROP=SYSTEM/'vmpower.service.d'
 PROBE=Path('/opt/vmpower-agent-qualification/slice-probe.py')
 
+class AdmissionRefused(RuntimeError):
+    def __init__(self,reason,resource='local'):
+        self.reason=reason;self.resource=resource
+        super().__init__('FIXTURE_ISOLATION_UNIT_COLLISION' if reason in ('LOADED_UNIT','UNIT_FILE','DROPIN','CGROUP') else 'FIXTURE_ISOLATION_ADMISSION_REFUSED')
+
+def failure_record(exc,phase):
+    reason=(exc.reason if isinstance(exc,AdmissionRefused) else
+            'QUERY_FAILED' if isinstance(exc,commands.CommandFailure) else
+            'SIGNAL' if isinstance(exc,commands.Interrupted) else
+            'IO_FAILED' if isinstance(exc,OSError) else 'UNKNOWN')
+    return {'phase':phase,'resource':exc.resource if isinstance(exc,AdmissionRefused) else 'local','reason':reason}
+
+def occupied(target):
+    try:Path(target).lstat();return True
+    except FileNotFoundError:return False
+
 def guard():
     if not (sys.platform=='linux' and os.geteuid()==0 and platform.machine()=='x86_64' and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted' and os.environ.get('ImageOS')=='ubuntu24'):
         raise RuntimeError('FIXTURE_ISOLATION_HOST_REFUSED')
@@ -147,10 +163,37 @@ def unit_group(key):
 
 def admit_units():
     # All three units and fixed cgroup paths must be absent BEFORE intent,
-    # file creation, systemd-run or stop. Never adopt a loaded same-name unit.
+    # file creation, systemd-run or stop. Named property queries load an absent
+    # implicit slice, so enumerate existing objects without querying those names.
+    n=names();keys=('slice','qualify','cleanup');units=[n[key] for key in keys]
+    for verb,reason in (('list-units','LOADED_UNIT'),('list-unit-files','UNIT_FILE')):
+        args=['systemctl',verb,'--plain','--full','--no-legend','--no-pager']
+        if verb=='list-units':args.append('--all')
+        rows=commands.run(*args,*units).stdout.splitlines()
+        for row in rows:
+            if not row.strip():continue
+            unit=row.split()[0]
+            if unit not in units:raise AdmissionRefused('PARSE_FAILED')
+            raise AdmissionRefused(reason,keys[units.index(unit)])
+    # The manager's lookup paths include control, transient and generator units.
+    # Drop-in-only definitions and dangling masks may be absent from both lists.
+    raw=commands.run('systemctl','show','--property=UnitPath','--value').stdout.strip()
+    paths=raw.split()
+    if not paths or len(paths)>64:raise AdmissionRefused('PARSE_FAILED')
+    for directory in paths:
+        if not re.fullmatch(r'/[A-Za-z0-9_./-]+',directory) or '..' in Path(directory).parts:
+            raise AdmissionRefused('PARSE_FAILED')
+        for key in keys:
+            target=Path(directory)/n[key]
+            if occupied(target):raise AdmissionRefused('UNIT_FILE',key)
+            if occupied(str(target)+'.d'):raise AdmissionRefused('DROPIN',key)
     for key in ('slice','qualify','cleanup'):
-        loaded=commands.run('systemctl','show',names()[key],'--property=LoadState','--value').stdout.strip()
-        if loaded!='not-found' or unit_group(key).exists():raise RuntimeError('FIXTURE_ISOLATION_UNIT_COLLISION')
+        if occupied(unit_group(key)):raise AdmissionRefused('CGROUP',key)
+
+def create_policy(target,raw):
+    # Never overwrite a file that appeared after the admission snapshot.
+    with target.open('xb') as stream:
+        os.fchmod(stream.fileno(),0o644);stream.write(raw)
 
 def stop_owned(out,key):
     data=journal(out);unit=names()[key];group=unit_group(key)
@@ -189,12 +232,14 @@ def supervise(out,cleanup_only=False,legacy=False):
     commands.OPERATION_FILE='operation-supervisor-linux.json'
     # The runner/control supervisor must never enter the fixture slice itself.
     if any(row.startswith('0::/'+n['slice']) for row in Path('/proc/self/cgroup').read_text().splitlines()):raise RuntimeError('FIXTURE_ISOLATION_SUPERVISOR_INSIDE')
-    if cleanup_only and not record.exists():return {'status':'NO_ISOLATION_JOURNAL'}
+    if cleanup_only and not record.exists():raise AdmissionRefused('NO_JOURNAL')
     if record.exists():
         saved=json.loads(record.read_text())
         if saved.get('identity')!=n:raise RuntimeError('FIXTURE_ISOLATION_JOURNAL_REFUSED')
         if saved.get('state')=='REMOVED':return {'status':'ALREADY_REMOVED'}
-    result={'status':'FAIL','qualifierScopeEmpty':False,'cleanupScopeEmpty':False,'isolationRemoved':False};error=None
+    result={'status':'FAIL','qualifierScopeEmpty':False,'cleanupScopeEmpty':False,'isolationRemoved':False};error=None;phase='LOCAL_PREFLIGHT'
+    supervisor=out/'evidence/supervisor-outcome-linux.json'
+    if cleanup_only and supervisor.exists():result['primarySupervisorOutcome']=json.loads(supervisor.read_text())
     outcome=out/'evidence/qualifier-outcome-linux.json'
     if cleanup_only and outcome.exists():result['qualifierOutcome']=json.loads(outcome.read_text())
     def scope(mode):
@@ -207,17 +252,21 @@ def supervise(out,cleanup_only=False,legacy=False):
         return commands.run(*args,timeout=750)
     try:
         if not cleanup_only:
-            if record.exists() or DROP.exists() or any(p.exists() for p in policy()):raise RuntimeError('FIXTURE_ISOLATION_OCCUPIED')
-            if commands.run('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()!='not-found':raise RuntimeError('FIXTURE_ISOLATION_SERVICE_OCCUPIED')
+            if occupied(record) or occupied(DROP) or any(occupied(p) for p in policy()):raise AdmissionRefused('LOCAL_PATH')
+            phase='SERVICE_PREFLIGHT'
+            if commands.run('systemctl','show','vmpower.service','--property=LoadState','--value').stdout.strip()!='not-found':raise AdmissionRefused('LOADED_UNIT','service')
+            phase='UNIT_ADMISSION'
             admit_units()
             data={'identity':n,'state':'INTENT','unitsAbsentAtAdmission':True,'ownershipToken':uuid.uuid4().hex,
                   'unitStates':{'slice':'CREATE_INTENT','qualify':'NOT_CREATED','cleanup':'NOT_CREATED'}}
             commands.atomic(record,data)
+            phase='POLICY_CREATION'
             DROP.mkdir(mode=0o755)
-            for target,raw in policy(token=data['ownershipToken']).items():target.write_bytes(raw);target.chmod(0o644)
+            for target,raw in policy(token=data['ownershipToken']).items():create_policy(target,raw)
             commands.run('systemctl','daemon-reload')
             data['state']='READY';commands.atomic(record,data)
             commands.atomic(outcome,{'status':'RUNNING'})
+            phase='QUALIFIER'
             try:
                 scope('qualify');result['qualifierOutcome']={'status':'PASS'}
             except BaseException as exc:
@@ -228,7 +277,8 @@ def supervise(out,cleanup_only=False,legacy=False):
             commands.atomic(outcome,result['qualifierOutcome'])
         # Previous cancellation can leave root dpkg/hooks. Stop and reap the
         # entire owned scope before any fresh cleanup hooks, never kill by name.
-        stop_scope(n['qualify'],out);result['qualifierScopeEmpty']=True
+        phase='REAP_QUALIFIER';stop_scope(n['qualify'],out);result['qualifierScopeEmpty']=True
+        phase='CLEANUP'
         if (out/'owned.json').exists():
             commands.atomic(out/'evidence/cleanup-linux.json',{'status':'RUNNING','resourceAbsence':'Unknown'})
             try:scope('cleanup')
@@ -254,6 +304,7 @@ def supervise(out,cleanup_only=False,legacy=False):
             accepted=json.loads(lifecycle.read_text());accepted['cleanup']=cleaned
             commands.atomic(lifecycle,accepted)
         data=journal(out)
+        phase='REMOVE_POLICY'
         stop_owned(out,'slice')
         for target,raw in policy(data.get('port',0),data['ownershipToken']).items():
             if not target.exists() and data['state']=='INTENT':continue
@@ -263,6 +314,12 @@ def supervise(out,cleanup_only=False,legacy=False):
         commands.run('systemctl','daemon-reload')
         data=journal(out);data['state']='REMOVED'
         result.update(status='PASS',isolationRemoved=True);commands.atomic(record,data)
+        if not cleanup_only:commands.atomic(supervisor,{'status':'FAIL' if error else 'PASS','phase':'QUALIFIER' if error else 'COMPLETE',**({'failure':failure_record(error,'QUALIFIER')} if error else {})})
+    except BaseException as exc:
+        result['failure']=failure_record(exc,phase)
+        # A later always-cleanup invocation cannot replace the original refusal.
+        if not cleanup_only or not supervisor.exists():commands.atomic(supervisor,{'status':'FAIL','failure':result['failure']})
+        raise
     finally:
         commands.atomic(out/'evidence/isolation-linux.json',result)
         receipt=out/'evidence/cleanup-linux.json'
