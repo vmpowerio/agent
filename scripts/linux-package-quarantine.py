@@ -18,7 +18,8 @@ class AdmissionRefused(RuntimeError):
 
 def failure_record(exc,phase):
     reason=(exc.reason if isinstance(exc,AdmissionRefused) else
-            'QUERY_FAILED' if isinstance(exc,commands.CommandFailure) else
+            'OWNED_SCOPE_FAILED' if type(exc) is commands.CommandFailure and exc.record.get('operation')=='OWNED_SCOPE' else
+            'COMMAND_FAILED' if isinstance(exc,commands.CommandFailure) else
             'SIGNAL' if isinstance(exc,commands.Interrupted) else
             'IO_FAILED' if isinstance(exc,OSError) else 'UNKNOWN')
     return {'phase':phase,'resource':exc.resource if isinstance(exc,AdmissionRefused) else 'local','reason':reason,

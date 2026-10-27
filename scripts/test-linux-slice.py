@@ -76,6 +76,90 @@ class CommandTests(unittest.TestCase):
         with self.assertRaises(commands.CommandFailure):commands.run(sys.executable,'-c','raise SystemExit(2)')
         self.assertEqual(json.loads((evidence/'progress-linux.json').read_text())['completed'][0]['phase'],'completed')
 
+class FailureDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
+        (self.root/'evidence').mkdir()
+        self.valid={'pid':123,'port':4567,'count':2,'rejected':0,'firstReportAt':1000,'lastReportAt':61000}
+    def state(self,value):
+        (self.root/'receiver.json').write_text(json.dumps(value))
+        return native.receiver_diagnostic(self.root)
+    def test_valid_state_projects_only_counts_and_derived_interval(self):
+        self.assertEqual(self.state(self.valid),{'state':'VALID','count':2,'rejected':0,'intervalMs':60000})
+        self.assertEqual(self.state({**self.valid,'count':0,'firstReportAt':None,'lastReportAt':None}),{'state':'VALID','count':0,'rejected':0,'intervalMs':None})
+    def test_missing_invalid_and_unverified_never_substitute_zero(self):
+        self.assertEqual(native.receiver_diagnostic(self.root)['state'],'MISSING')
+        for raw in ['', '{', 'secret'*1000, '[]']:
+            (self.root/'receiver.json').write_text(raw)
+            result=native.receiver_diagnostic(self.root)
+            self.assertEqual(result['state'],'INVALID');self.assertIsNone(result['count']);self.assertIsNone(result['rejected'])
+        with mock.patch.object(native.os,'open',side_effect=PermissionError('secret')):
+            self.assertEqual(native.receiver_diagnostic(self.root),{'state':'UNVERIFIED','count':None,'rejected':None,'intervalMs':None})
+    def test_invalid_fields_and_bounds(self):
+        for key,value in [('count',True),('count',-1),('count',1000001),('rejected','secret'),('firstReportAt',float('nan')),('lastReportAt',999),('lastReportAt',86401001),('pid',0),('port',65536)]:
+            with self.subTest(key=key,value=value):
+                result=self.state({**self.valid,key:value});self.assertEqual(result['state'],'INVALID');self.assertIsNone(result['count'])
+        self.assertEqual(self.state({**self.valid,'count':1})['state'],'INVALID')
+        self.assertEqual(self.state({**self.valid,'secret':'do-not-emit'})['state'],'INVALID')
+    def test_link_fifo_and_changed_file_cannot_be_valid(self):
+        target=self.root/'secret';target.write_text(json.dumps(self.valid));link=self.root/'receiver.json';link.symlink_to(target)
+        self.assertEqual(native.receiver_diagnostic(self.root)['state'],'UNVERIFIED');link.unlink()
+        os.mkfifo(link);self.assertEqual(native.receiver_diagnostic(self.root)['state'],'INVALID');link.unlink()
+        self.state(self.valid)
+        before=os.stat(link);after=mock.Mock(st_size=before.st_size,st_mtime_ns=before.st_mtime_ns+1)
+        with mock.patch.object(native.os,'fstat',side_effect=[before,after]):self.assertEqual(native.receiver_diagnostic(self.root)['state'],'UNVERIFIED')
+    def test_owned_location_and_secret_exception_are_closed(self):
+        filename=str(native.ROOT/'scripts/qualify-native-linux.py')
+        namespace={};exec(compile('def fail():\n    assert False, "secret/path?token=hidden"\n',filename,'exec'),namespace)
+        try:namespace['fail']()
+        except AssertionError as exc:result=native.failure_diagnostic(exc,self.root)
+        self.assertEqual(result['category'],'ASSERTION');self.assertEqual(result['locations'],[{'script':'qualify-native-linux.py','line':2}])
+        self.assertNotIn('secret',json.dumps(result));self.assertNotIn(str(native.ROOT),json.dumps(result))
+    def test_foreign_same_basename_and_long_or_nested_trace_are_bounded(self):
+        for filename in ['/foreign/qualify-native-linux.py',str(native.ROOT/'scripts/../scripts/qualify-native-linux.py'),'<secret>']:
+            namespace={};exec(compile('def fail():\n    raise KeyError("secret")\n',filename,'exec'),namespace)
+            try:namespace['fail']()
+            except KeyError as exc:result=native.failure_diagnostic(exc,self.root)
+            self.assertEqual(result['locations'],[]);self.assertEqual(result['category'],'KEY')
+        namespace={};exec(compile('def fail(n):\n    if n: return fail(n-1)\n    raise RuntimeError("secret")\n',str(native.ROOT/'scripts/qualify-native-linux.py'),'exec'),namespace)
+        try:namespace['fail'](70)
+        except RuntimeError as exc:result=native.failure_diagnostic(exc,self.root)
+        self.assertLessEqual(len(result['locations']),2)
+    def test_command_record_fields_are_whitelisted(self):
+        record={'operation':'OWNED_SCOPE','classification':'EXIT_NONZERO','exitCode':1,'argv':'secret','diagnosticLabels':['secret']}
+        result=native.failure_diagnostic(commands.CommandFailure(record),self.root)
+        self.assertEqual(result['command'],{'operation':'OWNED_SCOPE','classification':'EXIT_NONZERO','exitCode':1});self.assertNotIn('secret',json.dumps(result))
+        for code in [True,256,-65,'secret']:
+            self.assertEqual(native.command_diagnostic({'operation':'secret','classification':'secret','exitCode':code}),{'operation':'UNCLASSIFIED','classification':'UNCLASSIFIED','exitCode':None})
+    def test_hostile_exception_getters_and_diagnostic_errors_do_not_escape(self):
+        class Hostile(RuntimeError):
+            def __str__(self):raise AssertionError('secret')
+            def __getattribute__(self,name):raise AssertionError('secret')
+        self.assertEqual(native.failure_diagnostic(Hostile(),self.root)['category'],'OTHER')
+        with mock.patch.object(native,'receiver_diagnostic',side_effect=RuntimeError('secret')):
+            result=native.failure_diagnostic(AssertionError('primary-secret'),self.root)
+        self.assertEqual(result['category'],'ASSERTION');self.assertEqual(result['receiver']['state'],'UNVERIFIED')
+    def test_actual_qualifier_catch_preserves_primary_before_cleanup_overwrite(self):
+        failure=AssertionError('primary-secret');self.state(self.valid)
+        original={'operation':'NODE','classification':'EXIT_NONZERO','exitCode':2}
+        commands.atomic(self.root/'evidence/operation-linux.json',original)
+        (self.root/'evidence/prepared.json').write_text(json.dumps({'bundles':{'bundle':'a'*64},'head':'b'*40}))
+        with mock.patch.object(native,'guard'),mock.patch.object(native,'require_output',return_value=self.root),mock.patch.object(native,'MANAGED',[]),mock.patch.object(native,'command',return_value=mock.Mock(stdout='not-found')),mock.patch.object(native.pwd,'getpwnam',side_effect=KeyError),mock.patch.object(native.grp,'getgrnam',side_effect=KeyError),mock.patch.dict(os.environ,{'GITHUB_RUN_ID':'12345'}),mock.patch.object(native,'fixed_ancestor_metadata',side_effect=failure):
+            with self.assertRaises(AssertionError) as caught:native.qualify(self.root)
+        self.assertIs(caught.exception,failure)
+        saved=json.loads((self.root/'evidence/lifecycle-linux.json').read_text());snapshot=saved['diagnostic']
+        self.assertEqual(snapshot['category'],'ASSERTION');self.assertEqual(snapshot['lastCommand'],original);self.assertEqual(snapshot['receiver']['intervalMs'],60000)
+        commands.atomic(self.root/'evidence/operation-linux.json',{'operation':'SYSTEMCTL','classification':'SUCCESS','exitCode':0})
+        saved['cleanup']={'status':'PASS'};commands.atomic(self.root/'evidence/lifecycle-linux.json',saved)
+        self.assertEqual(json.loads((self.root/'evidence/lifecycle-linux.json').read_text())['diagnostic'],snapshot)
+        self.assertNotIn('primary-secret',json.dumps(saved))
+    def test_scope_exit_is_not_query_failure(self):
+        failure=commands.CommandFailure({'operation':'OWNED_SCOPE','classification':'EXIT_NONZERO','exitCode':1})
+        self.assertEqual(isolation.failure_record(failure,'QUALIFIER')['reason'],'OWNED_SCOPE_FAILED')
+        failure.record['operation']='SYSTEMCTL'
+        self.assertEqual(isolation.failure_record(failure,'CLEANUP')['reason'],'COMMAND_FAILED')
+        self.assertEqual(isolation.failure_record(isolation.AdmissionRefused('QUERY_FAILED',query='LIST_UNITS'),'UNIT_ADMISSION')['reason'],'QUERY_FAILED')
+
 class SliceTests(unittest.TestCase):
     def test_run_id_bounded_canonical_identity(self):
         for run in ['1','12345','99999999999999999999']:
