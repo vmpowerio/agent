@@ -1,6 +1,47 @@
 # Opt-in extension of the existing isolated Windows lifecycle fixture. Never run
 # standalone: it reuses that fixture's receiver, firewall, journal and cleanup.
 $script:lastPackageFailure=$null
+function Get-OwnedChocolateyFailureLabels([string]$CapturedOutput) {
+    # Output is a closed vocabulary only. Never return captured text, excerpts,
+    # paths, matches, exception messages or unknown property values.
+    $known=[ordered]@{
+        'Unexpected package tools location; shim preserved'='SHIM_PACKAGE_PATH_UNEXPECTED'
+        'Legacy shim root is unqualified; shim preserved'='SHIM_ROOT_UNQUALIFIED'
+        'Unsafe shim parent; shim preserved'='SHIM_PARENT_UNSAFE'
+        'Untrusted shim owner; shim preserved'='SHIM_OWNER_UNTRUSTED'
+        'Untrusted shim write access; shim preserved'='SHIM_ACL_UNTRUSTED'
+        'Unrecognized legacy shim file; shim preserved'='SHIM_FILE_UNRECOGNIZED'
+        'Unqualified legacy shim bytes; shim preserved'='SHIM_HASH_UNQUALIFIED'
+        'Shim changed during package operation; shim preserved'='SHIM_CHANGED_DURING_TRANSACTION'
+        'Qualified legacy shim removal failed'='SHIM_REMOVAL_FAILED'
+        'Reparse point in managed path'='MANAGED_PATH_REPARSE'
+        'Managed file must have exactly one link'='MANAGED_FILE_LINKS'
+        'Unqualified NSSM executable'='INSTALL_NSSM_UNQUALIFIED'
+        'Retained NSSM mismatch'='INSTALL_NSSM_RETAINED_MISMATCH'
+        'Bundle manifest hash mismatch'='INSTALL_BUNDLE_MANIFEST_MISMATCH'
+        'Bundle file hash mismatch'='INSTALL_BUNDLE_FILE_MISMATCH'
+        'Unexpected bundle files'='INSTALL_BUNDLE_MEMBERS_UNEXPECTED'
+        'First install requires configuration JSON on stdin'='INSTALL_CONFIG_MISSING'
+        'Invalid configuration JSON'='INSTALL_CONFIG_INVALID'
+        'Native operation timed out'='INSTALL_NATIVE_TIMEOUT'
+        'Native operation failed'='INSTALL_NATIVE_FAILED'
+        'Service failed to start'='INSTALL_SERVICE_START_FAILED'
+        'Service child exited during startup'='INSTALL_CHILD_EXITED'
+        'Service child restarted during startup'='INSTALL_CHILD_RESTARTED'
+        'Stable service child was not observed'='INSTALL_CHILD_NOT_STABLE'
+        'Existing service uses a custom identity; preserve it for explicit migration qualification'='INSTALL_IDENTITY_UNSUPPORTED'
+        'Existing service is not the NSSM contract'='INSTALL_SERVICE_CONTRACT_UNSUPPORTED'
+        'Install failed; previous service restored, configuration and all releases retained'='INSTALL_RUNTIME_RESTORED'
+        'Install failed and service rollback requires inspection; configuration and all releases retained'='INSTALL_ROLLBACK_FAILED'
+    }
+    $labels=@()
+    foreach ($message in $known.Keys) {
+        if ($CapturedOutput -and $CapturedOutput.Contains($message)) { $labels+=@($known[$message]) }
+    }
+    if ($labels.Count -eq 0) { return 'UNKNOWN' }
+    return $labels
+}
+
 function Invoke-OwnedChocolatey([string[]]$Arguments) {
     # Package extraction, ACL work and failing-child recovery can exceed the
     # installer's individual 30-second native-operation limit. Bound the whole
@@ -25,8 +66,9 @@ function Invoke-OwnedChocolatey([string[]]$Arguments) {
         if ($process.ExitCode -ne 0) {
             # Distinguish the intended crashing-child rollback from download,
             # lock, command-line or package-validation failures. Keep raw logs private.
-            $script:packageRecoveryObserved=($stdout.GetAwaiter().GetResult()+$stderr.GetAwaiter().GetResult()).Contains('Install failed; previous service restored, configuration and all releases retained')
-            $script:lastPackageFailure=@{classification='CHOCOLATEY_EXIT_NONZERO';operation=$operation;exitCode=$process.ExitCode;installerRecoveryObserved=$script:packageRecoveryObserved}
+            $diagnosticLabels=@(Get-OwnedChocolateyFailureLabels ($stdout.GetAwaiter().GetResult()+"`n"+$stderr.GetAwaiter().GetResult()))
+            $script:packageRecoveryObserved='INSTALL_RUNTIME_RESTORED' -cin $diagnosticLabels
+            $script:lastPackageFailure=@{classification='CHOCOLATEY_EXIT_NONZERO';operation=$operation;exitCode=$process.ExitCode;installerRecoveryObserved=$script:packageRecoveryObserved;diagnosticLabels=$diagnosticLabels}
             throw 'Chocolatey transaction failed'
         }
         return $stdout.GetAwaiter().GetResult().TrimEnd([char[]]"`r`n")

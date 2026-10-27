@@ -11,6 +11,26 @@ function Assert-Rejected([scriptblock]$Action,[string]$Name) {
     try { $null=& $Action } catch { $failed=$true }
     Assert-True $failed ('Unsafe cleanup accepted: '+$Name)
 }
+function Test-PackageFailureRedaction {
+    $privateText='secret=synthetic-do-not-emit; Authorization: Bearer synthetic-token; C:\private\customer.conf'
+    $cases=@(
+        @{text=$privateText;labels=@('UNKNOWN')},
+        @{text='';labels=@('UNKNOWN')},
+        @{text=('Unqualified legacy shim bytes; shim preserved'+"`n"+$privateText);labels=@('SHIM_HASH_UNQUALIFIED')},
+        @{text=($privateText+' Untrusted shim owner; shim preserved Untrusted shim write access; shim preserved');labels=@('SHIM_OWNER_UNTRUSTED','SHIM_ACL_UNTRUSTED')},
+        @{text='Install failed; previous service restored, configuration and all releases retained';labels=@('INSTALL_RUNTIME_RESTORED')},
+        @{text=('Unrecognized error: {"diagnosticLabels":["'+$privateText+'"]}');labels=@('UNKNOWN')}
+    )
+    foreach ($case in $cases) {
+        $labels=@(Get-OwnedChocolateyFailureLabels $case.text)
+        Assert-True (($labels -join ',') -ceq ($case.labels -join ',')) 'Fixed diagnostic classification differs'
+        $serialized=@{diagnosticLabels=$labels} | ConvertTo-Json -Compress
+        foreach ($forbidden in @('synthetic-do-not-emit','synthetic-token','customer.conf','Authorization','private')) {
+            Assert-True (-not $serialized.Contains($forbidden)) 'Captured text leaked into diagnostic receipt'
+        }
+    }
+    return $cases.Count
+}
 function Test-FailurePreservation([bool]$PrimaryFails,[bool]$CleanupFails) {
     # Execute the actual qualifier catch/finally blocks with a controlled try
     # body. This detects the original masking bug without running any lifecycle.
@@ -22,7 +42,8 @@ function Test-FailurePreservation([bool]$PrimaryFails,[bool]$CleanupFails) {
     $body=if ($PrimaryFails) { "throw 'synthetic-primary-do-not-persist'" } else { '$result.status="PASS"' }
     $control=[ScriptBlock]::Create('try {'+$body+'} catch '+$main[0].CatchClauses[0].Body.Extent.Text+' finally '+$main[0].Finally.Extent.Text)
     $result=@{status='PASS';phases=@(@{phase='known-completed-phase'});packageOwnership=@{phase='known-package-phase'}}
-    $script:lastPackageFailure=$null;$script:failureReceipt=$null
+    $script:lastPackageFailure=@{classification='CHOCOLATEY_EXIT_NONZERO';operation='upgrade';diagnosticLabels=@(Get-OwnedChocolateyFailureLabels 'Unqualified legacy shim bytes; shim preserved secret=synthetic-do-not-emit')}
+    $script:failureReceipt=$null
     $Output=$fixture
     function Recorded-Cleanup { return @{status=$(if ($CleanupFails) {'FAIL'} else {'PASS'});classification='controlled-cleanup'} }
     function Save-Json([string]$Path,$Value) { $script:failureReceipt=$Value | ConvertTo-Json -Depth 20 }
@@ -31,8 +52,10 @@ function Test-FailurePreservation([bool]$PrimaryFails,[bool]$CleanupFails) {
     Assert-True ($saved.status -eq 'FAIL') 'Qualification failure was hidden'
     Assert-True ($saved.cleanup.status -eq $(if ($CleanupFails) {'FAIL'} else {'PASS'})) 'Cleanup classification lost'
     Assert-True (-not $script:failureReceipt.Contains('synthetic-primary-do-not-persist')) 'Raw exception persisted'
+    Assert-True (-not $script:failureReceipt.Contains('synthetic-do-not-emit')) 'Captured package output persisted'
     if ($PrimaryFails) {
         Assert-True ($saved.primaryFailure.phase -eq 'known-package-phase' -and $saved.primaryFailure.classification -eq 'NATIVE_QUALIFICATION_FAILED') 'Primary failure masked by cleanup'
+        Assert-True (($saved.primaryFailure.packageCommandFailure.diagnosticLabels -join ',') -ceq 'SHIM_HASH_UNQUALIFIED') 'Fixed package diagnostic lost during receipt serialization'
     } else { Assert-True (-not $saved.PSObject.Properties['primaryFailure']) 'Cleanup failure invented a primary failure' }
 }
 $originalRoot=$env:ChocolateyInstall
@@ -90,7 +113,8 @@ try {
     Test-FailurePreservation $false $true;$cases++
     . (Join-Path $PSScriptRoot 'test-windows-product-shim.ps1')
     $productCases=Test-WindowsProductShim $fixture
-    @{status='PASS';cases=($cases+$productCases);originalControls=$cases;productHookControls=$productCases;productHookOwnershipProof='synthetic in wiring controls; actual proof in native package phases';packageOperations=0;serviceOperations=0;legacyExecutableRuns=0} | ConvertTo-Json -Compress
+    $redactionCases=Test-PackageFailureRedaction
+    @{status='PASS';cases=($cases+$productCases+$redactionCases);originalControls=$cases;productHookControls=$productCases;diagnosticRedactionControls=$redactionCases;productHookOwnershipProof='synthetic in wiring controls; actual proof in native package phases';packageOperations=0;serviceOperations=0;legacyExecutableRuns=0} | ConvertTo-Json -Compress
 } finally {
     $env:ChocolateyInstall=$originalRoot
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }

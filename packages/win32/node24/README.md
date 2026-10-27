@@ -5,6 +5,26 @@ PowerShell 5.1 and Chocolatey 2.7.4. That pass included fixture removal of an
 orphan legacy shim; it did not prove product-side shim cleanup. The following
 product-hook correction is source-only until a new admitted native run passes.
 
+Run `40445133666` at `0e9dc09` subsequently passed 26 preflight controls, four
+modeled finalization-state controls and the original nine lifecycle phases, but
+failed at the first docs-family modern package upgrade. Cleanup passed separately.
+No actual product shim handoff or post-activation package compensation passed in
+that run. Its underlying Chocolatey error was not retained, so the cause remains
+Unknown. The qualifier now maps captured output only to a closed set of fixed
+shim/installer labels; unrecognized errors become `UNKNOWN`. It never writes raw
+output, paths, credentials or excerpts. Six redaction controls include secret-like
+unknown errors and recognized errors mixed with secret-like text. New diagnostic
+execution remains unrun until an admitted native job proves it.
+
+Do not assume repeatable shim SHA-256 from a fixed Chocolatey version. The
+[official ShimGen repository](https://github.com/chocolatey/shimgen) says its
+generator is closed source; its published shim code is reference source, not the
+generator/build pipeline. Chocolatey's versioned generation caller supplies path,
+output, icon and optional GUI inputs, but provides no byte-reproducibility contract.
+The two observed hashes remain narrowly accepted evidence, not proof of all
+future generated shims. Hash drift is only an untested explanation for this run;
+do not add hashes or weaken ownership without actual discriminating evidence.
+
 The product hooks now preflight the exact `bin\vmpower-agent.amd64.exe` path and
 remove it inside the recoverable activation transaction, or before service removal
 on uninstall. Existing shims must match
